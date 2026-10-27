@@ -1,6 +1,7 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
 #include "Trackpad.h"
+#include "System/Config/ConfigHandler.h"
 
 #include <algorithm>
 #include <array>
@@ -105,7 +106,7 @@ void Touches(id self, SEL selector, id event)
 			++fingers;
 		}
 
-		if (fingers == 3 && !cancelled) {
+		if (fingers == 3 && !cancelled && configHandler->GetBool("MacTrackpadThreeFingerTilt")) {
 			std::sort(identities.begin(), identities.end(), std::less<id>());
 			center.x /= 3;
 			center.y /= 3;

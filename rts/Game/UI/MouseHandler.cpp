@@ -66,6 +66,7 @@ CONFIG(float, DoubleClickTime).defaultValue(200.0f).description("Double click ti
 CONFIG(float, ScrollWheelSpeed).defaultValue(-25.0f).minimumValue(-255.f).maximumValue(255.f);
 
 CONFIG(bool, MacTrackpadEnabled).defaultValue(false).description("Use macOS trackpad scroll to pan, pinch to zoom, and three-finger movement or Option-scroll to tilt. Mouse wheels and buttons retain their normal behavior.");
+CONFIG(bool, MacTrackpadThreeFingerTilt).defaultValue(false).description("Allow three-finger camera tilt. When disabled, use Option plus two-finger movement to tilt and avoid accidental palm gestures.");
 CONFIG(float, MacTrackpadPanSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
 CONFIG(float, MacTrackpadZoomSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
 CONFIG(float, MacTrackpadTiltSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
@@ -718,7 +719,7 @@ void CMouseHandler::TrackpadGesture(TrackpadAction action, float x, float y, boo
 				break;
 			}
 			case TrackpadAction::Tilt:
-				controller.MouseWheelMove(y * configHandler->GetFloat("MacTrackpadTiltSpeed"), dir);
+				controller.MouseWheelMove(-y * configHandler->GetFloat("MacTrackpadTiltSpeed"), dir);
 				break;
 		}
 
