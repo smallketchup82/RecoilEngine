@@ -19,6 +19,7 @@
 #endif // HEADLESS
 
 #include "Rendering/GL/myGL.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "Rendering/GlobalRendering.h"
 #include "Rendering/Textures/Bitmap.h"
 #include "System/Config/ConfigHandler.h"
@@ -667,6 +668,10 @@ CFontTexture::CFontTexture(const std::string& fontfile, int size, int _outlinesi
 	if (fontSize <= 0)
 		fontSize = 14;
 
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	fontRasterScale = MacEGLBridge::GetFontRasterScale();
+#endif
+
 	fontFamily = "unknown";
 	fontStyle  = "unknown";
 
@@ -674,7 +679,7 @@ CFontTexture::CFontTexture(const std::string& fontfile, int size, int _outlinesi
 #ifndef HEADLESS
 
 	try {
-		shFace = GetRenderFontFace(fontfile, fontSize);
+		shFace = GetRenderFontFace(fontfile, fontSize * fontRasterScale);
 	}
 	catch (content_error& ex) {
 		LOG_L(L_ERROR, "[%s] %s (s=%d): %s", __func__, fontfile.c_str(), fontSize, ex.what());
@@ -686,7 +691,7 @@ CFontTexture::CFontTexture(const std::string& fontfile, int size, int _outlinesi
 
 	FT_Face face = *shFace;
 
-	normScale = 1.0f / (fontSize * FT_INTERNAL_DPI);
+	normScale = 1.0f / (fontSize * fontRasterScale * FT_INTERNAL_DPI);
 	float pixScale = 1.0;
 	bool canScale = false;
 
@@ -809,8 +814,23 @@ bool CFontTexture::AddFallbackFont(const std::string& fontfile)
 
 	// Store pattern
 	FcPattern* pattern = FcFreeTypeQueryFace(face, reinterpret_cast<const FcChar8*>(fontfile.c_str()), 0, NULL);
+	if (pattern == nullptr) {
+		LOG_L(L_WARNING, "[%s] could not query pattern for %s", __func__, fontfile.c_str());
+		return false;
+	}
+
+	// QueryFace turns a relative path into one under the working directory,
+	// which LoadFontFace cannot open through the VFS. Keep the name that loaded.
+	FcPatternDel(pattern, FC_FILE);
+	if (!FcPatternAddString(pattern, FC_FILE, reinterpret_cast<const FcChar8*>(fontfile.c_str()))) {
+		FcPatternDestroy(pattern);
+		LOG_L(L_WARNING, "[%s] could not keep filename for %s", __func__, fontfile.c_str());
+		return false;
+	}
+
 	if (!FcFontSetAdd(set, pattern))
 	{
+		FcPatternDestroy(pattern);
 		LOG_L(L_WARNING, "[%s] could not add pattern for %s", __func__, fontfile.c_str());
 		return false;
 	}
@@ -1121,7 +1141,7 @@ void CFontTexture::LoadWantedGlyphs(const std::vector<char32_t>& allWanted)
 				++idx;
 			}
 		}
-		f = GetFontForCharacters(map, *shFace, fontSize, alreadyCheckedFonts);
+		f = GetFontForCharacters(map, *shFace, fontSize * fontRasterScale, alreadyCheckedFonts);
 	} while (!map.empty() && f);
 
 	// handle glyphs that didn't reach maxFontTries number of attempts, but nonetheless failed
@@ -1190,10 +1210,10 @@ void CFontTexture::LoadWantedGlyphs(const std::vector<char32_t>& allWanted)
 				blurRectangles.emplace_back(
 					std::max<int>(0, x),
 					std::max<int>(0, y),
-					std::min<int>(wantedTexWidth,  x + 2*outlineSize + atlasGlyphs[glyphIdx].xsize),
-					std::min<int>(wantedTexHeight, y + 2*outlineSize + atlasGlyphs[glyphIdx].ysize)
+					std::min<int>(wantedTexWidth,  x + 2*outlineSize*fontRasterScale + atlasGlyphs[glyphIdx].xsize),
+					std::min<int>(wantedTexHeight, y + 2*outlineSize*fontRasterScale + atlasGlyphs[glyphIdx].ysize)
 				);
-				atlasUpdateShadow.CopySubImage(atlasGlyphs[glyphIdx], x + outlineSize, y + outlineSize);
+				atlasUpdateShadow.CopySubImage(atlasGlyphs[glyphIdx], x + outlineSize*fontRasterScale, y + outlineSize*fontRasterScale);
 			}
 		}
 
@@ -1268,7 +1288,7 @@ void CFontTexture::LoadGlyph(std::shared_ptr<FontFace>& f, char32_t ch, unsigned
 	if (width <= 0 || height <= 0)
 		return;
 
-	const int olSize = 2 * outlineSize;
+	const int olSize = 2 * outlineSize * fontRasterScale;
 	const int channels = slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA ? 4 : 1;
 
 	if (slot->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY && slot->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA) {
@@ -1493,7 +1513,7 @@ void CFontTexture::UpdateGlyphAtlasTexture()
 	if (atlasUpdateShadow.xsize == atlasUpdate.xsize && atlasUpdateShadow.ysize == atlasUpdate.ysize) {
 		for_mt(0, blurRectangles.size(), [&](int i) {
 			SRectangle& rect = blurRectangles[i];
-			atlasUpdateShadow.Blur(outlineSize, outlineWeight, rect.x1, rect.y1, rect.x2-rect.x1, rect.y2-rect.y1);
+			atlasUpdateShadow.Blur(outlineSize * fontRasterScale, outlineWeight, rect.x1, rect.y1, rect.x2-rect.x1, rect.y2-rect.y1);
 		});
 		blurRectangles.clear();
 

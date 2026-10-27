@@ -1,7 +1,6 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
-#ifndef MOUSEHANDLER_H
-#define MOUSEHANDLER_H
+#pragma once
 
 #include <string>
 #include <vector>
@@ -51,7 +50,10 @@ public:
 	void MouseRelease(int x, int y, int button);
 	void MousePress(int x, int y, int button);
 	void MouseMove(int x, int y, int dx, int dy);
-	void MouseWheel(float delta);
+	void MouseWheel(float delta, bool moveCamera = true);
+
+	enum class TrackpadAction { Pan, Pinch, Tilt };
+	void TrackpadGesture(TrackpadAction action, float x, float y, bool begin, bool end, bool momentum);
 
 	// input emulation (debug.emulateMouse*): a button held independent of hardware.
 	// SetButtonEmulated fires the press/release itself, on the physical-or-emulated edge
@@ -136,6 +138,8 @@ private:
 	bool hardwareCursor = false;
 	bool invertMouse = false;
 	bool ignoreMove = false;
+	// 0: new sequence; 1: camera; 2: UI; 3: blocked by a drag/focus loss.
+	int trackpadTargets[3] = {};
 
 	float cursorScale = 1.0f;
 
@@ -188,5 +192,3 @@ private:
 };
 
 extern CMouseHandler* mouse;
-
-#endif /* MOUSEHANDLER_H */

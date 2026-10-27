@@ -3,6 +3,7 @@
 #include <string>
 
 #include "VerticalSync.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "GL/myGL.h"
 #include "System/SpringMath.h"
 #include "System/Config/ConfigHandler.h"
@@ -61,6 +62,13 @@ void CVerticalSync::Toggle()
 void CVerticalSync::SetInterval() { SetInterval(configHandler->GetInt("VSync")); }
 void CVerticalSync::SetInterval(int i)
 {
+	#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	if (MacEGLBridge::Active()) {
+		// This port always presents through the synchronized Metal renderer.
+		configHandler->Set("VSync", i = 1);
+	}
+	#endif
+
 	// recursion is already prevented (Set only notifies on changed
 	// values), this just avoids making the SDL calls a second time
 	if ((i = std::clamp(i, MAX_ADAPTIVE_INTERVAL, MAX_STANDARD_INTERVAL)) == interval)
@@ -70,6 +78,14 @@ void CVerticalSync::SetInterval(int i)
 
 	#if defined HEADLESS
 	return;
+	#endif
+
+	#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	if (MacEGLBridge::Active()) {
+		MacEGLBridge::SetSwapInterval(interval);
+		LOG("[VSync::%s] interval=%d (Mesa EGL bridge)", __func__, interval);
+		return;
+	}
 	#endif
 
 	// adaptive (delay swap iff frame-rate > vblank-rate)

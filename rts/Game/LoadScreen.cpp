@@ -4,6 +4,7 @@
 #include <functional>
 
 #include "Rendering/GL/myGL.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "LoadScreen.h"
 #include "Game.h"
 #include "GlobalUnsynced.h"
@@ -261,6 +262,9 @@ bool CLoadScreen::Update()
 	ZoneScoped;
 
 	if (luaIntro != nullptr) {
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+		MacEGLBridge::BeginUI();
+#endif
 		// keep checking this while we are the active controller
 		std::lock_guard<spring::recursive_mutex> lck(mutex);
 
@@ -328,7 +332,11 @@ bool CLoadScreen::Draw()
 void CLoadScreen::SetLoadMessage(const std::string& text, bool replaceLast)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
-	spring::UnfreezeSpring(WDT_LOAD);
+	// the loading thread must not pump window events, the main thread does that
+	if (mtLoading)
+		Watchdog::ClearTimer(WDT_LOAD);
+	else
+		spring::UnfreezeSpring(WDT_LOAD);
 
 	std::lock_guard<spring::recursive_mutex> lck(mutex);
 

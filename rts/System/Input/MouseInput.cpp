@@ -27,6 +27,10 @@
 #include "System/MainDefines.h"
 #include "System/SafeUtil.h"
 
+#ifdef __APPLE__
+#include "System/Platform/Mac/Trackpad.h"
+#endif
+
 #include <SDL_events.h>
 #include <SDL_hints.h>
 #include <SDL_syswm.h>
@@ -64,6 +68,16 @@ IMouseInput::~IMouseInput()
 
 bool IMouseInput::HandleSDLMouseEvent(const SDL_Event& event)
 {
+#ifdef __APPLE__
+	MacTrackpad::Gesture gesture;
+	if (MacTrackpad::GetGesture(event, gesture)) {
+		if (mouse != nullptr && gesture.windowID == SDL_GetWindowID(globalRendering->GetWindow())) {
+			mouse->TrackpadGesture(static_cast<CMouseHandler::TrackpadAction>(gesture.action), gesture.x, gesture.y, gesture.begin, gesture.end, gesture.momentum);
+		}
+		return false;
+	}
+#endif
+
 	switch (event.type) {
 		case SDL_MOUSEMOTION: {
 			mousepos = int2(event.motion.x, event.motion.y);
@@ -89,7 +103,7 @@ bool IMouseInput::HandleSDLMouseEvent(const SDL_Event& event)
 		} break;
 		case SDL_MOUSEWHEEL: {
 			if (mouse != nullptr)
-				mouse->MouseWheel(event.wheel.y);
+				mouse->MouseWheel(event.wheel.preciseY != 0.0f ? event.wheel.preciseY : float(event.wheel.y));
 
 		} break;
 		case SDL_WINDOWEVENT: {

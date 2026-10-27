@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include "LuaOpenGL.h"
+#include "Rendering/GL/MacEGLBridge.h"
 
 #include "LuaInclude.h"
 #include "LuaContextData.h"
@@ -27,6 +28,7 @@
 #include "LuaFonts.h"
 #include "LuaHandle.h"
 #include "LuaHashString.h"
+#include "LuaImmediateBatch.h"
 #include "LuaIO.h"
 #include "LuaOpenGLUtils.h"
 #include "LuaRBOs.h"
@@ -83,6 +85,7 @@
 
 CONFIG(bool, LuaShaders).defaultValue(true).headlessValue(false).safemodeValue(false);
 CONFIG(int, DeprecatedGLWarnLevel).defaultValue(0).headlessValue(0).safemodeValue(0);
+CONFIG(bool, LuaImmediateModeBuffering).defaultValue(true).description("Draw each gl.BeginEnd block with one glDrawArrays instead of one glVertex call per vertex. 0 restores glBegin/glEnd.");
 
 /*** Callouts for OpenGL API
  *
@@ -179,6 +182,16 @@ std::vector<LuaOpenGL::OcclusionQuery*> LuaOpenGL::occlusionQueries;
 
 
 
+static bool UsingUnsupportedLinePolygonMode()
+{
+	if (globalRendering->supportPolygonModeLine)
+		return false;
+
+	GLint modes[2];
+	glGetIntegerv(GL_POLYGON_MODE, modes);
+	return (modes[0] == GL_LINE);
+}
+
 static inline CUnit* ParseUnit(lua_State* L, const char* caller, int index)
 {
 	if (!lua_isnumber(L, index)) {
@@ -251,11 +264,27 @@ static CFeature* ParseFeature(lua_State* L, const char* caller, int index)
 /******************************************************************************/
 /******************************************************************************/
 
+namespace {
+	LuaImmediateBatch luaBatch(LuaImmediateBatch::ReadGLValue);
+
+	// read at the start of each block, so it can be flipped at runtime for A/B runs
+	bool immediateBuffering = true;
+
+	struct ImmediateBufferingObserver {
+		void ConfigNotify(const std::string& key, const std::string& value) {
+			immediateBuffering = (std::atoi(value.c_str()) != 0);
+		}
+	} immediateBufferingObserver;
+}
+
 void LuaOpenGL::Init()
 {
 	glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
 
 	canUseShaders = configHandler->GetBool("LuaShaders");
+
+	immediateBuffering = configHandler->GetBool("LuaImmediateModeBuffering");
+	configHandler->NotifyOnChange(&immediateBufferingObserver, {"LuaImmediateModeBuffering"});
 
 	deprecatedGLWarnLevel = configHandler->GetInt("DeprecatedGLWarnLevel");
 	if (deprecatedGLWarnLevel == 1)
@@ -266,6 +295,8 @@ void LuaOpenGL::Init()
 
 void LuaOpenGL::Free()
 {
+	configHandler->RemoveObserver(&immediateBufferingObserver);
+
 	glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
 
 	for (const OcclusionQuery* q: occlusionQueries) {
@@ -288,6 +319,7 @@ bool LuaOpenGL::PushEntries(lua_State* L)
 
 	REGISTER_LUA_CFUNC(GetScreenViewTrans);
 	REGISTER_LUA_CFUNC(GetViewSizes);
+	REGISTER_LUA_CFUNC(GetSceneSize);
 	REGISTER_LUA_CFUNC(GetViewRange);
 
 	REGISTER_LUA_CFUNC(DrawMiniMap);
@@ -1107,6 +1139,61 @@ inline void LuaOpenGL::CheckDrawingEnabled(lua_State* L, const char* caller)
 	}
 }
 
+inline bool LuaOpenGL::CheckDrawingAllowed(lua_State* L, const char* caller)
+{
+	CheckDrawingEnabled(L, caller);
+
+	// GL rejects everything except vertex data between glBegin and glEnd, so do the same
+	return !luaBatch.Active();
+}
+
+
+namespace {
+	// Immediate mode helpers for the engine's own fixed shape draws. They buffer when
+	// enabled and fall back to glBegin otherwise. The block is closed by what opened it.
+	void ImmBegin(GLenum mode)
+	{
+		// inside an open buffered block the inner block must join it, whatever the flag says now
+		if (immediateBuffering || luaBatch.Active()) {
+			luaBatch.Begin(mode);
+		} else {
+			glBegin(mode);
+		}
+	}
+
+	void ImmEnd()
+	{
+		if (luaBatch.Active()) {
+			LuaImmediateBatch::Issue(luaBatch.End());
+		} else {
+			glEnd();
+		}
+	}
+
+	// Outside a buffered block these call the plain GL function, so the unbuffered path is unchanged.
+	void ImmVertex(float x, float y)                       { if (luaBatch.Active()) luaBatch.Vertex(x, y, 0.0f, 1.0f); else glVertex2f(x, y); }
+	void ImmVertex(float x, float y, float z)              { if (luaBatch.Active()) luaBatch.Vertex(x, y, z, 1.0f);    else glVertex3f(x, y, z); }
+	void ImmVertex(float x, float y, float z, float w)     { if (luaBatch.Active()) luaBatch.Vertex(x, y, z, w);       else glVertex4f(x, y, z, w); }
+
+	void ImmColor(const float* rgba)                       { if (luaBatch.Active()) luaBatch.Color(rgba);              else glColor4fv(rgba); }
+	void ImmNormal(float x, float y, float z)              { if (luaBatch.Active()) luaBatch.Normal(x, y, z);          else glNormal3f(x, y, z); }
+	void ImmSecondaryColor(float r, float g, float b)      { if (luaBatch.Active()) luaBatch.SecondaryColor(r, g, b);  else glSecondaryColor3f(r, g, b); }
+	void ImmFogCoord(float f)                              { if (luaBatch.Active()) luaBatch.FogCoord(f);              else glFogCoordf(f); }
+	void ImmEdgeFlag(bool e)                               { if (luaBatch.Active()) luaBatch.EdgeFlag(e);              else glEdgeFlag(e); }
+
+	// glTexCoord1f to 4f set the components they leave out to 0, 0 and 1
+	void ImmTexCoord(float s)                              { if (luaBatch.Active()) luaBatch.TexCoord(0, s, 0.0f, 0.0f, 1.0f); else glTexCoord1f(s); }
+	void ImmTexCoord(float s, float t)                     { if (luaBatch.Active()) luaBatch.TexCoord(0, s, t, 0.0f, 1.0f);    else glTexCoord2f(s, t); }
+	void ImmTexCoord(float s, float t, float r)            { if (luaBatch.Active()) luaBatch.TexCoord(0, s, t, r, 1.0f);       else glTexCoord3f(s, t, r); }
+	void ImmTexCoord(float s, float t, float r, float q)   { if (luaBatch.Active()) luaBatch.TexCoord(0, s, t, r, q);          else glTexCoord4f(s, t, r, q); }
+
+	void ImmMultiTexCoord(unsigned u, float s)                            { if (luaBatch.Active()) luaBatch.TexCoord(u, s, 0.0f, 0.0f, 1.0f); else glMultiTexCoord1f(GL_TEXTURE0 + u, s); }
+	void ImmMultiTexCoord(unsigned u, float s, float t)                   { if (luaBatch.Active()) luaBatch.TexCoord(u, s, t, 0.0f, 1.0f);    else glMultiTexCoord2f(GL_TEXTURE0 + u, s, t); }
+	void ImmMultiTexCoord(unsigned u, float s, float t, float r)          { if (luaBatch.Active()) luaBatch.TexCoord(u, s, t, r, 1.0f);       else glMultiTexCoord3f(GL_TEXTURE0 + u, s, t, r); }
+	void ImmMultiTexCoord(unsigned u, float s, float t, float r, float q) { if (luaBatch.Active()) luaBatch.TexCoord(u, s, t, r, q);          else glMultiTexCoord4f(GL_TEXTURE0 + u, s, t, r, q); }
+}
+
+
 inline void LuaOpenGL::CondWarnDeprecatedGL(lua_State* L, const char* caller)
 {
 	if (deprecatedGLWarnLevel <= 0)
@@ -1230,6 +1317,24 @@ int LuaOpenGL::GetViewSizes(lua_State* L)
 	return 2;
 }
 
+/***
+ * Main scene resolution in pixels, independent of logical UI coordinates.
+ * @function gl.GetSceneSize
+ * @return integer width
+ * @return integer height
+ */
+int LuaOpenGL::GetSceneSize(lua_State* L)
+{
+	int width = globalRendering->viewSizeX;
+	int height = globalRendering->viewSizeY;
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	MacEGLBridge::ScaleSceneSize(width, height);
+#endif
+	lua_pushinteger(L, width);
+	lua_pushinteger(L, height);
+	return 2;
+}
+
 
 /***
  * @function gl.GetViewRange
@@ -1296,7 +1401,8 @@ int LuaOpenGL::ConfigMiniMap(lua_State* L)
  */
 int LuaOpenGL::DrawMiniMap(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	if (minimap == nullptr)
 		return 0;
@@ -1347,7 +1453,8 @@ int LuaOpenGL::DrawMiniMap(lua_State* L)
  */
 int LuaOpenGL::BeginText(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	auto userDefinedBlending = luaL_optboolean(L, 2, false);
 	font->Begin(userDefinedBlending);
 	return 0;
@@ -1359,7 +1466,8 @@ int LuaOpenGL::BeginText(lua_State* L)
  */
 int LuaOpenGL::EndText(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	font->End();
 	return 0;
 }
@@ -1392,7 +1500,8 @@ int LuaOpenGL::EndText(lua_State* L)
  */
 int LuaOpenGL::Text(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 
@@ -1614,7 +1723,8 @@ static void GLObjectShapeTextures(lua_State* L, const SolidObjectDef* def)
 
 int LuaOpenGL::UnitCommon(lua_State* L, bool applyTransform, bool callDrawUnit)
 {
-	LuaOpenGL::CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	CUnit* unit = ParseUnit(L, __func__, 1);
 
@@ -1695,7 +1805,8 @@ int LuaOpenGL::UnitRaw(lua_State* L) { return (UnitCommon(L, false, false)); }
  */
 int LuaOpenGL::UnitTextures(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectTextures(L, unitHandler.GetUnit(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1710,7 +1821,8 @@ int LuaOpenGL::UnitTextures(lua_State* L)
  */
 int LuaOpenGL::UnitShape(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectShape(L, unitDefHandler->GetUnitDefByID(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1722,7 +1834,8 @@ int LuaOpenGL::UnitShape(lua_State* L)
  */
 int LuaOpenGL::UnitShapeTextures(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectShapeTextures(L, unitDefHandler->GetUnitDefByID(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1734,7 +1847,8 @@ int LuaOpenGL::UnitShapeTextures(lua_State* L)
  */
 int LuaOpenGL::UnitMultMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const CUnit* unit = ParseUnit(L, __func__, 1);
@@ -1771,7 +1885,8 @@ int LuaOpenGL::UnitPieceMatrix(lua_State* L) {return (UnitPieceMultMatrix(L)); }
  */ 
 int LuaOpenGL::UnitPieceMultMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	GLObjectPieceMultMatrix(L, ParseUnit(L, __func__, 1));
 	return 0;
@@ -1782,7 +1897,8 @@ int LuaOpenGL::UnitPieceMultMatrix(lua_State* L)
 
 int LuaOpenGL::FeatureCommon(lua_State* L, bool applyTransform, bool callDrawFeature)
 {
-	LuaOpenGL::CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	CFeature* feature = ParseFeature(L, __func__, 1);
 
@@ -1861,7 +1977,8 @@ int LuaOpenGL::FeatureRaw(lua_State* L) { return (FeatureCommon(L, false, false)
  */
 int LuaOpenGL::FeatureTextures(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectTextures(L, featureHandler.GetFeature(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1876,7 +1993,8 @@ int LuaOpenGL::FeatureTextures(lua_State* L)
  */
 int LuaOpenGL::FeatureShape(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectShape(L, featureDefHandler->GetFeatureDefByID(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1888,7 +2006,8 @@ int LuaOpenGL::FeatureShape(lua_State* L)
  */
 int LuaOpenGL::FeatureShapeTextures(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	GLObjectShapeTextures(L, featureDefHandler->GetFeatureDefByID(luaL_checkint(L, 1)));
 	return 0;
 }
@@ -1900,7 +2019,8 @@ int LuaOpenGL::FeatureShapeTextures(lua_State* L)
  */
 int LuaOpenGL::FeatureMultMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const CFeature* feature = ParseFeature(L, __func__, 1);
@@ -1939,7 +2059,8 @@ int LuaOpenGL::FeaturePieceMatrix(lua_State* L) { return (FeaturePieceMultMatrix
  */
 int LuaOpenGL::FeaturePieceMultMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	GLObjectPieceMultMatrix(L, ParseFeature(L, __func__, 1));
 	return 0;
@@ -1964,7 +2085,8 @@ int LuaOpenGL::FeaturePieceMultMatrix(lua_State* L)
  */
 int LuaOpenGL::DrawListAtUnit(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	// is visible to current read team, is not an icon
@@ -2015,7 +2137,8 @@ int LuaOpenGL::DrawListAtUnit(lua_State* L)
  */
 int LuaOpenGL::DrawFuncAtUnit(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	// is visible to current read team, is not an icon
 	const CUnit* unit = ParseDrawUnit(L, __func__, 1);
@@ -2070,7 +2193,8 @@ int LuaOpenGL::DrawFuncAtUnit(lua_State* L)
  */
 int LuaOpenGL::DrawGroundCircle(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const float3 pos(luaL_checkfloat(L, 1),
 	                 luaL_checkfloat(L, 2),
@@ -2132,7 +2256,8 @@ int LuaOpenGL::DrawGroundCircle(lua_State* L)
 int LuaOpenGL::DrawGroundQuad(lua_State* L)
 {
 	// FIXME: incomplete (esp. texcoord clamping)
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const float x0 = luaL_checknumber(L, 1);
 	const float z0 = luaL_checknumber(L, 2);
 	const float x1 = luaL_checknumber(L, 3);
@@ -2186,16 +2311,16 @@ int LuaOpenGL::DrawGroundQuad(lua_State* L)
 			const int xit = xib + 1;
 			const float xb = xib * SQUARE_SIZE;
 			const float xt = xb + SQUARE_SIZE;
-			glBegin(GL_TRIANGLE_STRIP);
+			ImmBegin(GL_TRIANGLE_STRIP);
 			for (int zi = zis; zi <= zie; zi++) {
 				const int ziOff = zi * mapxi;
 				const float yb = heightmap[ziOff + xib];
 				const float yt = heightmap[ziOff + xit];
 				const float z = zi * SQUARE_SIZE;
-				glVertex3f(xt, yt, z);
-				glVertex3f(xb, yb, z);
+				ImmVertex(xt, yt, z);
+				ImmVertex(xb, yb, z);
 			}
-			glEnd();
+			ImmEnd();
 		}
 	} else {
 		const float tuStep = (tu1 - tu0) / float(xie - xis);
@@ -2209,19 +2334,19 @@ int LuaOpenGL::DrawGroundQuad(lua_State* L)
 			const float xt = xb + SQUARE_SIZE;
 			const float tut = tub + tuStep;
 			float tv = tv0;
-			glBegin(GL_TRIANGLE_STRIP);
+			ImmBegin(GL_TRIANGLE_STRIP);
 			for (int zi = zis; zi <= zie; zi++) {
 				const int ziOff = zi * mapxi;
 				const float yb = heightmap[ziOff + xib];
 				const float yt = heightmap[ziOff + xit];
 				const float z = zi * SQUARE_SIZE;
-				glTexCoord2f(tut, tv);
-				glVertex3f(xt, yt, z);
-				glTexCoord2f(tub, tv);
-				glVertex3f(xb, yb, z);
+				ImmTexCoord(tut, tv);
+				ImmVertex(xt, yt, z);
+				ImmTexCoord(tub, tv);
+				ImmVertex(xb, yb, z);
 				tv += tvStep;
 			}
-			glEnd();
+			ImmEnd();
 			tub += tuStep;
 		}
 	}
@@ -2334,7 +2459,10 @@ int LuaOpenGL::Shape(lua_State* L)
 
 	const GLuint type = (GLuint)luaL_checkint(L, 1);
 
-	glBegin(type);
+	// parse everything before drawing, luaL_error does not return and
+	// must not leave a block open
+	static std::vector<VertexData> vertices;
+	vertices.clear();
 
 	const int table = 2;
 	int i = 1;
@@ -2346,17 +2474,21 @@ int LuaOpenGL::Shape(lua_State* L)
 			luaL_error(L, "Shape: bad vertex data");
 			break;
 		}
-		if (vd.hasColor) { glColor4fv(vd.color);   }
-		if (vd.hasTxcd)  { glTexCoord2fv(vd.txcd); }
-		if (vd.hasNorm)  { glNormal3fv(vd.norm);   }
-		if (vd.hasVert)  { glVertex3fv(vd.vert);   } // always last
+		vertices.push_back(vd);
 	}
 	if (!lua_isnil(L, -1)) {
 		luaL_error(L, "Shape: bad vertex data, not a table");
 	}
 	// lua_pop(L, 1);
 
-	glEnd();
+	ImmBegin(type);
+	for (const VertexData& vd: vertices) {
+		if (vd.hasColor) { ImmColor(vd.color);                                  }
+		if (vd.hasTxcd)  { ImmTexCoord(vd.txcd[0], vd.txcd[1]);                 }
+		if (vd.hasNorm)  { ImmNormal(vd.norm[0], vd.norm[1], vd.norm[2]);       }
+		if (vd.hasVert)  { ImmVertex(vd.vert[0], vd.vert[1], vd.vert[2]);       } // always last
+	}
+	ImmEnd();
 
 	return 0;
 }
@@ -2379,16 +2511,20 @@ int LuaOpenGL::BeginEnd(lua_State* L)
 	if ((args < 2) || !lua_isfunction(L, 2)) {
 		luaL_error(L, "Incorrect arguments to gl.BeginEnd(type, func, ...)");
 	}
-	const GLuint primMode = (GLuint)luaL_checkint(L, 1);
+	GLuint primMode = (GLuint)luaL_checkint(L, 1);
+
+	// exact for the common single-quad/polygon outline case
+	if ((primMode == GL_QUADS || primMode == GL_POLYGON) && UsingUnsupportedLinePolygonMode())
+		primMode = GL_LINE_LOOP;
 
 	if (primMode == GL_POINTS) {
 		WorkaroundATIPointSizeBug();
 	}
 
 	// call the function
-	glBegin(primMode);
+	ImmBegin(primMode);
 	const int error = lua_pcall(L, (args - 2), 0, 0);
-	glEnd();
+	ImmEnd();
 
 	if (error != 0) {
 		LOG_L(L_ERROR, "gl.BeginEnd: error(%i) = %s",
@@ -2443,17 +2579,17 @@ int LuaOpenGL::Vertex(lua_State* L)
 		const float y = lua_tofloat(L, -1);
 		lua_rawgeti(L, 1, 3);
 		if (!lua_isnumber(L, -1)) {
-			glVertex2f(x, y);
+			ImmVertex(x, y);
 			return 0;
 		}
 		const float z = lua_tofloat(L, -1);
 		lua_rawgeti(L, 1, 4);
 		if (!lua_isnumber(L, -1)) {
-			glVertex3f(x, y, z);
+			ImmVertex(x, y, z);
 			return 0;
 		}
 		const float w = lua_tofloat(L, -1);
-		glVertex4f(x, y, z, w);
+		ImmVertex(x, y, z, w);
 		return 0;
 	}
 
@@ -2461,19 +2597,19 @@ int LuaOpenGL::Vertex(lua_State* L)
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
 		const float z = luaL_checkfloat(L, 3);
-		glVertex3f(x, y, z);
+		ImmVertex(x, y, z);
 	}
 	else if (args == 2) {
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
-		glVertex2f(x, y);
+		ImmVertex(x, y);
 	}
 	else if (args == 4) {
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
 		const float z = luaL_checkfloat(L, 3);
 		const float w = luaL_checkfloat(L, 4);
-		glVertex4f(x, y, z, w);
+		ImmVertex(x, y, z, w);
 	}
 	else {
 		luaL_error(L, "Incorrect arguments to gl.Vertex()");
@@ -2519,14 +2655,14 @@ int LuaOpenGL::Normal(lua_State* L)
 			luaL_error(L, "Bad data passed to gl.Normal()");
 		}
 		const float z = lua_tofloat(L, -1);
-		glNormal3f(x, y, z);
+		ImmNormal(x, y, z);
 		return 0;
 	}
 
 	const float x = luaL_checkfloat(L, 1);
 	const float y = luaL_checkfloat(L, 2);
 	const float z = luaL_checkfloat(L, 3);
-	glNormal3f(x, y, z);
+	ImmNormal(x, y, z);
 	return 0;
 }
 
@@ -2564,7 +2700,7 @@ int LuaOpenGL::TexCoord(lua_State* L)
 	if (args == 1) {
 		if (lua_isnumber(L, 1)) {
 			const float x = lua_tofloat(L, 1);
-			glTexCoord1f(x);
+			ImmTexCoord(x);
 			return 0;
 		}
 		if (!lua_istable(L, 1)) {
@@ -2577,43 +2713,43 @@ int LuaOpenGL::TexCoord(lua_State* L)
 		const float x = lua_tofloat(L, -1);
 		lua_rawgeti(L, 1, 2);
 		if (!lua_isnumber(L, -1)) {
-			glTexCoord1f(x);
+			ImmTexCoord(x);
 			return 0;
 		}
 		const float y = lua_tofloat(L, -1);
 		lua_rawgeti(L, 1, 3);
 		if (!lua_isnumber(L, -1)) {
-			glTexCoord2f(x, y);
+			ImmTexCoord(x, y);
 			return 0;
 		}
 		const float z = lua_tofloat(L, -1);
 		lua_rawgeti(L, 1, 4);
 		if (!lua_isnumber(L, -1)) {
-			glTexCoord3f(x, y, z);
+			ImmTexCoord(x, y, z);
 			return 0;
 		}
 		const float w = lua_tofloat(L, -1);
-		glTexCoord4f(x, y, z, w);
+		ImmTexCoord(x, y, z, w);
 		return 0;
 	}
 
 	if (args == 2) {
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
-		glTexCoord2f(x, y);
+		ImmTexCoord(x, y);
 	}
 	else if (args == 3) {
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
 		const float z = luaL_checkfloat(L, 3);
-		glTexCoord3f(x, y, z);
+		ImmTexCoord(x, y, z);
 	}
 	else if (args == 4) {
 		const float x = luaL_checkfloat(L, 1);
 		const float y = luaL_checkfloat(L, 2);
 		const float z = luaL_checkfloat(L, 3);
 		const float w = luaL_checkfloat(L, 4);
-		glTexCoord4f(x, y, z, w);
+		ImmTexCoord(x, y, z, w);
 	}
 	else {
 		luaL_error(L, "Incorrect arguments to gl.TexCoord()");
@@ -2659,14 +2795,12 @@ int LuaOpenGL::MultiTexCoord(lua_State* L)
 	if ((texNum < 0) || (texNum >= CGlobalRendering::MAX_TEXTURE_UNITS)) {
 		luaL_error(L, "Bad texture unit(%i) given to gl.%s()", __func__, texNum);
 	}
-	const GLenum texUnit = GL_TEXTURE0 + texNum;
-
 	const int args = lua_gettop(L) - 1; // number of arguments
 
 	if (args == 1) {
 		if (lua_isnumber(L, 2)) {
 			const float x = lua_tofloat(L, 2);
-			glMultiTexCoord1f(texUnit, x);
+			ImmMultiTexCoord(texNum, x);
 			return 0;
 		}
 		if (!lua_istable(L, 2)) {
@@ -2679,43 +2813,43 @@ int LuaOpenGL::MultiTexCoord(lua_State* L)
 		const float x = lua_tofloat(L, -1);
 		lua_rawgeti(L, 2, 2);
 		if (!lua_isnumber(L, -1)) {
-			glMultiTexCoord1f(texUnit, x);
+			ImmMultiTexCoord(texNum, x);
 			return 0;
 		}
 		const float y = lua_tofloat(L, -1);
 		lua_rawgeti(L, 2, 3);
 		if (!lua_isnumber(L, -1)) {
-			glMultiTexCoord2f(texUnit, x, y);
+			ImmMultiTexCoord(texNum, x, y);
 			return 0;
 		}
 		const float z = lua_tofloat(L, -1);
 		lua_rawgeti(L, 2, 4);
 		if (!lua_isnumber(L, -1)) {
-			glMultiTexCoord3f(texUnit, x, y, z);
+			ImmMultiTexCoord(texNum, x, y, z);
 			return 0;
 		}
 		const float w = lua_tofloat(L, -1);
-		glMultiTexCoord4f(texUnit, x, y, z, w);
+		ImmMultiTexCoord(texNum, x, y, z, w);
 		return 0;
 	}
 
 	if (args == 2) {
 		const float x = luaL_checkfloat(L, 2);
 		const float y = luaL_checkfloat(L, 3);
-		glMultiTexCoord2f(texUnit, x, y);
+		ImmMultiTexCoord(texNum, x, y);
 	}
 	else if (args == 3) {
 		const float x = luaL_checkfloat(L, 2);
 		const float y = luaL_checkfloat(L, 3);
 		const float z = luaL_checkfloat(L, 4);
-		glMultiTexCoord3f(texUnit, x, y, z);
+		ImmMultiTexCoord(texNum, x, y, z);
 	}
 	else if (args == 4) {
 		const float x = luaL_checkfloat(L, 2);
 		const float y = luaL_checkfloat(L, 3);
 		const float z = luaL_checkfloat(L, 4);
 		const float w = luaL_checkfloat(L, 5);
-		glMultiTexCoord4f(texUnit, x, y, z, w);
+		ImmMultiTexCoord(texNum, x, y, z, w);
 	}
 	else {
 		luaL_error(L, "Incorrect arguments to gl.MultiTexCoord()");
@@ -2760,14 +2894,14 @@ int LuaOpenGL::SecondaryColor(lua_State* L)
 			luaL_error(L, "Bad data passed to gl.SecondaryColor()");
 		}
 		const float z = lua_tofloat(L, -1);
-		glSecondaryColor3f(x, y, z);
+		ImmSecondaryColor(x, y, z);
 		return 0;
 	}
 
 	const float x = luaL_checkfloat(L, 1);
 	const float y = luaL_checkfloat(L, 2);
 	const float z = luaL_checkfloat(L, 3);
-	glSecondaryColor3f(x, y, z);
+	ImmSecondaryColor(x, y, z);
 	return 0;
 }
 
@@ -2782,7 +2916,7 @@ int LuaOpenGL::FogCoord(lua_State* L)
 	CondWarnDeprecatedGL(L, __func__);
 
 	const float value = luaL_checkfloat(L, 1);
-	glFogCoordf(value);
+	ImmFogCoord(value);
 	return 0;
 }
 
@@ -2797,7 +2931,7 @@ int LuaOpenGL::EdgeFlag(lua_State* L)
 	CondWarnDeprecatedGL(L, __func__);
 
 	if (lua_isboolean(L, 1)) {
-		glEdgeFlag(lua_toboolean(L, 1));
+		ImmEdgeFlag(lua_toboolean(L, 1));
 	}
 	return 0;
 }
@@ -2814,11 +2948,23 @@ int LuaOpenGL::EdgeFlag(lua_State* L)
  */
 int LuaOpenGL::Rect(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const float x1 = luaL_checkfloat(L, 1);
 	const float y1 = luaL_checkfloat(L, 2);
 	const float x2 = luaL_checkfloat(L, 3);
 	const float y2 = luaL_checkfloat(L, 4);
+
+	if (UsingUnsupportedLinePolygonMode()) {
+		ImmBegin(GL_LINE_LOOP);
+		ImmVertex(x1, y1);
+		ImmVertex(x2, y1);
+		ImmVertex(x2, y2);
+		ImmVertex(x1, y2);
+		ImmEnd();
+		return 0;
+	}
+
 	glRectf(x1, y1, x2, y2);
 	return 0;
 }
@@ -2847,7 +2993,8 @@ int LuaOpenGL::Rect(lua_State* L)
 
 int LuaOpenGL::TexRect(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 
@@ -2874,13 +3021,13 @@ int LuaOpenGL::TexRect(lua_State* L)
 			t1 = 0.0f;
 			t2 = 1.0f;
 		}
-		glBegin(GL_QUADS); {
-			glTexCoord2f(s1, t1); glVertex2f(x1, y1);
-			glTexCoord2f(s2, t1); glVertex2f(x2, y1);
-			glTexCoord2f(s2, t2); glVertex2f(x2, y2);
-			glTexCoord2f(s1, t2); glVertex2f(x1, y2);
+		ImmBegin(GL_QUADS); {
+			ImmTexCoord(s1, t1); ImmVertex(x1, y1);
+			ImmTexCoord(s2, t1); ImmVertex(x2, y1);
+			ImmTexCoord(s2, t2); ImmVertex(x2, y2);
+			ImmTexCoord(s1, t2); ImmVertex(x1, y2);
 		}
-		glEnd();
+		ImmEnd();
 		return 0;
 	}
 
@@ -2888,13 +3035,13 @@ int LuaOpenGL::TexRect(lua_State* L)
 	const float t1 = luaL_checkfloat(L, 6);
 	const float s2 = luaL_checkfloat(L, 7);
 	const float t2 = luaL_checkfloat(L, 8);
-	glBegin(GL_QUADS); {
-		glTexCoord2f(s1, t1); glVertex2f(x1, y1);
-		glTexCoord2f(s2, t1); glVertex2f(x2, y1);
-		glTexCoord2f(s2, t2); glVertex2f(x2, y2);
-		glTexCoord2f(s1, t2); glVertex2f(x1, y2);
+	ImmBegin(GL_QUADS); {
+		ImmTexCoord(s1, t1); ImmVertex(x1, y1);
+		ImmTexCoord(s2, t1); ImmVertex(x2, y1);
+		ImmTexCoord(s2, t2); ImmVertex(x2, y2);
+		ImmTexCoord(s1, t2); ImmVertex(x1, y2);
 	}
-	glEnd();
+	ImmEnd();
 
 	return 0;
 }
@@ -3006,7 +3153,7 @@ int LuaOpenGL::Color(lua_State* L)
 		luaL_error(L, "Incorrect arguments to gl.Color()");
 	}
 
-	glColor4fv(color.data());
+	ImmColor(color.data());
 
 	return 0;
 }
@@ -3028,7 +3175,8 @@ int LuaOpenGL::Color(lua_State* L)
  */
 int LuaOpenGL::Material(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -3100,7 +3248,8 @@ int LuaOpenGL::Material(lua_State* L)
  */
 int LuaOpenGL::ResetState(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	ResetGLState();
 	return 0;
 }
@@ -3111,7 +3260,8 @@ int LuaOpenGL::ResetState(lua_State* L)
  */
 int LuaOpenGL::ResetMatrices(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args != 0) {
@@ -3130,7 +3280,8 @@ int LuaOpenGL::ResetMatrices(lua_State* L)
  */
 int LuaOpenGL::Lighting(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	if (luaL_checkboolean(L, 1)) {
 		glEnable(GL_LIGHTING);
@@ -3147,7 +3298,8 @@ int LuaOpenGL::Lighting(lua_State* L)
  */
 int LuaOpenGL::ShadeModel(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	glShadeModel((GLenum)luaL_checkint(L, 1));
 	return 0;
@@ -3166,7 +3318,8 @@ int LuaOpenGL::ShadeModel(lua_State* L)
  */
 int LuaOpenGL::Scissor(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args == 1) {
@@ -3203,7 +3356,8 @@ int LuaOpenGL::Scissor(lua_State* L)
  */
 int LuaOpenGL::Viewport(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int x = luaL_checkint(L, 1);
 	const int y = luaL_checkint(L, 2);
@@ -3232,7 +3386,8 @@ int LuaOpenGL::Viewport(lua_State* L)
  */
 int LuaOpenGL::ColorMask(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args == 1) {
@@ -3260,7 +3415,8 @@ int LuaOpenGL::ColorMask(lua_State* L)
  */
 int LuaOpenGL::DepthMask(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	if (luaL_checkboolean(L, 1)) {
 		glDepthMask(GL_TRUE);
 	} else {
@@ -3287,7 +3443,8 @@ int LuaOpenGL::DepthMask(lua_State* L)
  */
 int LuaOpenGL::DepthTest(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args != 1) {
@@ -3318,7 +3475,8 @@ int LuaOpenGL::DepthTest(lua_State* L)
  */
 int LuaOpenGL::DepthClamp(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	luaL_checktype(L, 1, LUA_TBOOLEAN);
 	if (lua_toboolean(L, 1)) {
 		glEnable(GL_DEPTH_CLAMP);
@@ -3345,7 +3503,8 @@ int LuaOpenGL::DepthClamp(lua_State* L)
 
 int LuaOpenGL::Culling(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args != 1) {
@@ -3389,7 +3548,8 @@ int LuaOpenGL::Culling(lua_State* L)
  */
 int LuaOpenGL::LogicOp(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args != 1) {
@@ -3420,7 +3580,8 @@ int LuaOpenGL::LogicOp(lua_State* L)
  */
 int LuaOpenGL::Fog(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	if (luaL_checkboolean(L, 1)) {
@@ -3447,7 +3608,8 @@ int LuaOpenGL::Fog(lua_State* L)
  */
 int LuaOpenGL::Blending(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args == 1) {
@@ -3513,7 +3675,8 @@ int LuaOpenGL::Blending(lua_State* L)
  */
 int LuaOpenGL::BlendEquation(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum mode = (GLenum)luaL_checkint(L, 1);
 	glBlendEquation(mode);
 	return 0;
@@ -3527,7 +3690,8 @@ int LuaOpenGL::BlendEquation(lua_State* L)
  */
 int LuaOpenGL::BlendFunc(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum src = (GLenum)luaL_checkint(L, 1);
 	const GLenum dst = (GLenum)luaL_checkint(L, 2);
 	glBlendFunc(src, dst);
@@ -3542,7 +3706,8 @@ int LuaOpenGL::BlendFunc(lua_State* L)
  */
 int LuaOpenGL::BlendEquationSeparate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum modeRGB   = (GLenum)luaL_checkint(L, 1);
 	const GLenum modeAlpha = (GLenum)luaL_checkint(L, 2);
 	glBlendEquationSeparate(modeRGB, modeAlpha);
@@ -3559,7 +3724,8 @@ int LuaOpenGL::BlendEquationSeparate(lua_State* L)
  */
 int LuaOpenGL::BlendFuncSeparate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum srcRGB   = (GLenum)luaL_checkint(L, 1);
 	const GLenum dstRGB   = (GLenum)luaL_checkint(L, 2);
 	const GLenum srcAlpha = (GLenum)luaL_checkint(L, 3);
@@ -3589,7 +3755,8 @@ int LuaOpenGL::BlendFuncSeparate(lua_State* L)
  */
 int LuaOpenGL::AlphaTest(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -3620,7 +3787,8 @@ int LuaOpenGL::AlphaToCoverage(lua_State* L)
 	if (!force && globalRendering->msaaLevel < 4)
 		return 0;
 
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	if (luaL_checkboolean(L, 1)) {
 		glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE_ARB);
 	}
@@ -3650,7 +3818,8 @@ int LuaOpenGL::AlphaToCoverage(lua_State* L)
  */
 int LuaOpenGL::PolygonMode(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum face = (GLenum)luaL_checkint(L, 1);
 	const GLenum mode = (GLenum)luaL_checkint(L, 2);
 	glPolygonMode(face, mode);
@@ -3676,7 +3845,8 @@ int LuaOpenGL::PolygonMode(lua_State* L)
  */
 int LuaOpenGL::PolygonOffset(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if (args == 1) {
@@ -3711,7 +3881,8 @@ int LuaOpenGL::PolygonOffset(lua_State* L)
  */
 int LuaOpenGL::StencilTest(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	luaL_checktype(L, 1, LUA_TBOOLEAN);
 	if (lua_toboolean(L, 1)) {
 		glEnable(GL_STENCIL_TEST);
@@ -3729,7 +3900,8 @@ int LuaOpenGL::StencilTest(lua_State* L)
  */
 int LuaOpenGL::StencilMask(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLuint mask = luaL_checkint(L, 1);
 	glStencilMask(mask);
 	return 0;
@@ -3745,7 +3917,8 @@ int LuaOpenGL::StencilMask(lua_State* L)
  */
 int LuaOpenGL::StencilFunc(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum func = luaL_checkint(L, 1);
 	const GLint  ref  = luaL_checkint(L, 2);
 	const GLuint mask = luaL_checkint(L, 3);
@@ -3763,7 +3936,8 @@ int LuaOpenGL::StencilFunc(lua_State* L)
  */
 int LuaOpenGL::StencilOp(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum fail  = luaL_checkint(L, 1);
 	const GLenum zfail = luaL_checkint(L, 2);
 	const GLenum zpass = luaL_checkint(L, 3);
@@ -3780,7 +3954,8 @@ int LuaOpenGL::StencilOp(lua_State* L)
  */
 int LuaOpenGL::StencilMaskSeparate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum face = luaL_checkint(L, 1);
 	const GLuint mask = luaL_checkint(L, 2);
 	glStencilMaskSeparate(face, mask);
@@ -3798,7 +3973,8 @@ int LuaOpenGL::StencilMaskSeparate(lua_State* L)
  */
 int LuaOpenGL::StencilFuncSeparate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum face = luaL_checkint(L, 1);
 	const GLenum func = luaL_checkint(L, 2);
 	const GLint  ref  = luaL_checkint(L, 3);
@@ -3818,7 +3994,8 @@ int LuaOpenGL::StencilFuncSeparate(lua_State* L)
  */
 int LuaOpenGL::StencilOpSeparate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum face  = luaL_checkint(L, 1);
 	const GLenum fail  = luaL_checkint(L, 2);
 	const GLenum zfail = luaL_checkint(L, 3);
@@ -3846,7 +4023,8 @@ int LuaOpenGL::StencilOpSeparate(lua_State* L)
  */
 int LuaOpenGL::LineStipple(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -4028,7 +4206,8 @@ int LuaOpenGL::Texture(lua_State* L)
 	// ...          --  named textures
 	//
 
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	if (lua_gettop(L) < 1)
 		luaL_error(L, "Incorrect [number of] arguments to gl.Texture()");
@@ -4339,10 +4518,12 @@ int LuaOpenGL::TextureInfo(lua_State* L)
  * @param h integer
  * @param target GL?
  * @param level GL?
+ * @param physicalSource boolean? Copy physical source pixels without logical-coordinate downsampling (Default: false).
  */
 int LuaOpenGL::CopyToTexture(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const std::string& texture = luaL_checkstring(L, 1);
 
@@ -4367,7 +4548,12 @@ int LuaOpenGL::CopyToTexture(lua_State* L)
 	const auto target = (GLenum)luaL_optnumber(L, 8, tex->target);
 	const auto level  = (GLenum)luaL_optnumber(L, 9, 0);
 
-	glCopyTexSubImage2D(target, level, xoff, yoff, x, y, w, h);
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	if (luaL_optboolean(L, 10, false))
+		MacEGLBridge::CopyToTexturePixels(target, level, xoff, yoff, x, y, w, h);
+	else
+#endif
+		glCopyTexSubImage2D(target, level, xoff, yoff, x, y, w, h);
 
 	if (tex->target != GL_TEXTURE_2D) {glDisable(tex->target);}
 
@@ -4384,7 +4570,8 @@ int LuaOpenGL::CopyToTexture(lua_State* L)
  */
 int LuaOpenGL::RenderToTexture(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const std::string& texture = luaL_checkstring(L, 1);
 
@@ -4401,9 +4588,7 @@ int LuaOpenGL::RenderToTexture(lua_State* L)
 		return 0;
 
 	GLint currentFBO = 0;
-	if (drawMode == DRAW_WORLD_SHADOW) {
-		glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &currentFBO);
-	}
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &currentFBO);
 
 	glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, tex->fbo);
 
@@ -4463,7 +4648,8 @@ int LuaOpenGL::GenerateMipmap(lua_State* L)
  */
 int LuaOpenGL::ActiveTexture(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 	if ((args < 2) || !lua_isnumber(L, 1) || !lua_isfunction(L, 2)) {
@@ -4506,7 +4692,8 @@ int LuaOpenGL::ActiveTexture(lua_State* L)
  */
 int LuaOpenGL::TexEnv(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const GLenum target = (GLenum)luaL_checknumber(L, 1);
@@ -4552,7 +4739,8 @@ int LuaOpenGL::TexEnv(lua_State* L)
  */
 int LuaOpenGL::MultiTexEnv(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int texNum    =    luaL_checkint(L, 1);
@@ -4622,7 +4810,8 @@ static void SetTexGenState(GLenum target, bool state)
  */
 int LuaOpenGL::TexGen(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const GLenum target = (GLenum)luaL_checknumber(L, 1);
@@ -4683,7 +4872,8 @@ int LuaOpenGL::TexGen(lua_State* L)
  */
 int LuaOpenGL::MultiTexGen(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int texNum = luaL_checkint(L, 1);
@@ -4758,7 +4948,8 @@ int LuaOpenGL::MultiTexGen(lua_State* L)
  */
 int LuaOpenGL::BindImageTexture(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	int argNum = 1;
 	//unit
@@ -5092,7 +5283,8 @@ int LuaOpenGL::GetEngineAtlasTextures(lua_State* L) {
  */
 int LuaOpenGL::Clear(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int args = lua_gettop(L); // number of arguments
 
@@ -5133,7 +5325,8 @@ int LuaOpenGL::Clear(lua_State* L)
  */
 int LuaOpenGL::SwapBuffers(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	// only meant for frame-limited LuaMenu's that want identical content in both buffers
 	if (!CLuaHandle::GetHandle(L)->PersistOnReload())
@@ -5153,7 +5346,8 @@ int LuaOpenGL::SwapBuffers(lua_State* L)
  */
 int LuaOpenGL::Translate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const float x = luaL_checkfloat(L, 1);
 	const float y = luaL_checkfloat(L, 2);
@@ -5171,7 +5365,8 @@ int LuaOpenGL::Translate(lua_State* L)
  */
 int LuaOpenGL::Scale(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const float x = luaL_checkfloat(L, 1);
 	const float y = luaL_checkfloat(L, 2);
@@ -5190,7 +5385,8 @@ int LuaOpenGL::Scale(lua_State* L)
  */
 int LuaOpenGL::Rotate(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const float r = luaL_checkfloat(L, 1);
 	const float x = luaL_checkfloat(L, 2);
@@ -5212,7 +5408,8 @@ int LuaOpenGL::Rotate(lua_State* L)
  */
 int LuaOpenGL::Ortho(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const float left   = luaL_checknumber(L, 1);
 	const float right  = luaL_checknumber(L, 2);
@@ -5236,7 +5433,8 @@ int LuaOpenGL::Ortho(lua_State* L)
  */
 int LuaOpenGL::Frustum(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const float left   = luaL_checknumber(L, 1);
 	const float right  = luaL_checknumber(L, 2);
@@ -5254,7 +5452,8 @@ int LuaOpenGL::Frustum(lua_State* L)
  */
 int LuaOpenGL::Billboard(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	glMultMatrixf(camera->GetBillBoardMatrix());
 	return 0;
@@ -5285,7 +5484,8 @@ int LuaOpenGL::Billboard(lua_State* L)
  */
 int LuaOpenGL::Light(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const GLenum light = GL_LIGHT0 + (GLint)luaL_checknumber(L, 1);
@@ -5348,7 +5548,8 @@ int LuaOpenGL::Light(lua_State* L)
  */
 int LuaOpenGL::ClipPlane(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int plane = luaL_checkint(L, 1);
@@ -5381,7 +5582,8 @@ int LuaOpenGL::ClipPlane(lua_State* L)
  * @param enable boolean
  */
 int LuaOpenGL::ClipDistance(lua_State* L) {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 
 	const int clipId = luaL_checkint(L, 1);
 
@@ -5414,7 +5616,8 @@ int LuaOpenGL::ClipDistance(lua_State* L) {
  */
 int LuaOpenGL::MatrixMode(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	GLenum mode = (GLenum)luaL_checkint(L, 1);
 	if (!GetLuaContextData(L)->glMatrixTracker.SetMatrixMode(mode))
@@ -5429,7 +5632,8 @@ int LuaOpenGL::MatrixMode(lua_State* L)
  */
 int LuaOpenGL::LoadIdentity(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -5491,7 +5695,8 @@ int LuaOpenGL::LoadIdentity(lua_State* L)
  */
 int LuaOpenGL::LoadMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int luaType = lua_type(L, 1);
@@ -5550,7 +5755,8 @@ int LuaOpenGL::LoadMatrix(lua_State* L)
  */
 int LuaOpenGL::MultMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int luaType = lua_type(L, 1);
@@ -5585,7 +5791,8 @@ int LuaOpenGL::MultMatrix(lua_State* L)
  */
 int LuaOpenGL::PushMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -5606,7 +5813,8 @@ int LuaOpenGL::PushMatrix(lua_State* L)
  */
 int LuaOpenGL::PopMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	const int args = lua_gettop(L); // number of arguments
@@ -5634,7 +5842,8 @@ int LuaOpenGL::PopMatrix(lua_State* L)
  */
 int LuaOpenGL::PushPopMatrix(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 
 	std::vector<GLenum> matModes;
@@ -5770,7 +5979,8 @@ int LuaOpenGL::GetMatrixData(lua_State* L)
  */
 int LuaOpenGL::PushAttrib(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	int mask = luaL_optnumber(L, 1, static_cast<lua_Number>(GL_ALL_ATTRIB_BITS));
 	if (mask < 0) {
 		mask = -mask;
@@ -5786,7 +5996,8 @@ int LuaOpenGL::PushAttrib(lua_State* L)
  */
 int LuaOpenGL::PopAttrib(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	glPopAttrib();
 	return 0;
 }
@@ -5807,7 +6018,8 @@ int LuaOpenGL::PopAttrib(lua_State* L)
  */
 int LuaOpenGL::UnsafeState(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const GLenum state = (GLenum)luaL_checkint(L, 1);
 	int funcLoc = 2;
 	bool reverse = false;
@@ -5840,7 +6052,8 @@ int LuaOpenGL::UnsafeState(lua_State* L)
  */
 int LuaOpenGL::GetFixedState(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	const char* param = luaL_checkstring(L, 1);
 	const bool toStr = luaL_optboolean(L, 2, false);
 
@@ -6177,7 +6390,8 @@ int LuaOpenGL::CreateList(lua_State* L)
  */
 int LuaOpenGL::CallList(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	CondWarnDeprecatedGL(L, __func__);
 	const unsigned int listIndex = luaL_checkint(L, 1);
 	const CLuaDisplayLists& displayLists = CLuaHandle::GetActiveDisplayLists(L);
@@ -6223,7 +6437,8 @@ int LuaOpenGL::DeleteList(lua_State* L)
  */
 int LuaOpenGL::Flush(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	glFlush();
 	return 0;
 }
@@ -6234,7 +6449,8 @@ int LuaOpenGL::Flush(lua_State* L)
  */
 int LuaOpenGL::Finish(lua_State* L)
 {
-	CheckDrawingEnabled(L, __func__);
+	if (!CheckDrawingAllowed(L, __func__))
+		return 0;
 	glFinish();
 	return 0;
 }

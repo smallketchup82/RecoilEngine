@@ -647,7 +647,6 @@ int LuaFBOs::ActiveFBO(lua_State* L)
 		return 0;
 
 	glPushAttrib(GL_VIEWPORT_BIT);
-	glViewport(0, 0, fbo->xsize, fbo->ysize);
 	if (identities) {
 		glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
 		glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
@@ -656,6 +655,9 @@ int LuaFBOs::ActiveFBO(lua_State* L)
 	GLint currentFBO = 0;
 	glGetIntegerv(bindTarget, &currentFBO);
 	glBindFramebufferEXT(target, fbo->id);
+	// The viewport belongs to this target, which can have a different pixel
+	// density from the window (notably the Retina UI framebuffer on macOS).
+	glViewport(0, 0, fbo->xsize, fbo->ysize);
 
 	const int error = lua_pcall(L, (lua_gettop(L) - funcIndex), 0, 0);
 

@@ -1,6 +1,7 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
 #include "LuaMenuController.h"
+#include "Rendering/GL/MacEGLBridge.h"
 
 #include "Game/GlobalUnsynced.h"
 #include "Game/UI/InfoConsole.h"
@@ -117,6 +118,11 @@ bool CLuaMenuController::Draw()
 	const bool forceDraw = ((spring_gettime() - lastDrawFrameTime).toSecsi() > 30);
 
 	if (allowDraw || forceDraw) {
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+		MacEGLBridge::BeginUI();
+		// The lobby does not reset its viewport each frame like the game does.
+		glViewport(globalRendering->viewPosX, globalRendering->viewPosY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+#endif
 		globalRendering->drawFrame = std::max(1U, globalRendering->drawFrame + 1);
 		ClearScreen();
 

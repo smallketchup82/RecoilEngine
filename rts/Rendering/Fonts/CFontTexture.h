@@ -1,7 +1,6 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
-#ifndef _CFONTTEXTURE_H
-#define _CFONTTEXTURE_H
+#pragma once
 
 #include <string>
 #include <memory>
@@ -171,6 +170,7 @@ protected:
 	float fontDescender;
 	float normScale;
 	int fontSize;
+	int fontRasterScale = 1;
 	std::string fontFamily;
 	std::string fontStyle;
 
@@ -215,5 +215,3 @@ public:
 	auto GetGlyphs() const -> const decltype(glyphs) { return glyphs; }
 	auto GetGlyphs()       ->       decltype(glyphs) { return glyphs; }
 };
-
-#endif // CFONTTEXTURE_H

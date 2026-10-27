@@ -5,6 +5,7 @@
 #include <Rml/Backends/RmlUi_Backend.h>
 #include <RmlUi/Core.h>
 #include "Game.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "Camera.h"
 #include "CameraHandler.h"
 #include "ChatMessage.h"
@@ -1445,6 +1446,12 @@ bool CGame::Draw() {
 
 	SetDrawMode(gameNormalDraw);
 
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	// Chili builds cached UI display lists in DrawGenesis. Their clipping
+	// rectangles must be recorded at the same density used to draw the UI.
+	MacEGLBridge::BeginUI();
+#endif
+
 	// Bind per-drawFrame UBO
 	UniformConstants::GetInstance().Bind();
 
@@ -1495,6 +1502,9 @@ bool CGame::Draw() {
 
 	//FIXME move both to UpdateUnsynced?
 	CTeamHighlight::Enable(spring_tomsecs(currentTimePreDraw));
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	MacEGLBridge::BeginScene();
+#endif
 	{
 		minimap->Update();
 
@@ -1519,6 +1529,10 @@ bool CGame::Draw() {
 			unitDrawer->DrawUnitIconsScreen();
 
 		eventHandler.DrawScreenEffects();
+
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+		MacEGLBridge::BeginUI();
+#endif
 
 		hudDrawer->Draw((gu->GetMyPlayer())->fpsController.GetControllee());
 		debugDrawerAI->Draw();
@@ -1612,7 +1626,13 @@ void CGame::DrawInterfaceWidgets()
 	if (showFPS) {
 		static constexpr float4 yellow(1.0f, 1.0f, 0.25f, 1.0f);
 		smallFont->SetColors(&yellow,NULL);
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+		const char* modes[] = {"Standard", "Retina UI", "Full Retina"};
+		smallFont->glFormat(0.99f, 0.92f, 1.0f, INF_FONT_FLAGS, "%.0f FPS | %.1f ms | %s",
+			globalRendering->FPS, 1000.0f / std::max(globalRendering->FPS, 1.0f), modes[MacEGLBridge::GetRetinaMode()]);
+#else
 		smallFont->glFormat(0.99f, 0.92f, 1.0f, INF_FONT_FLAGS, "%.0f", globalRendering->FPS);
+#endif
 	}
 
 	if (showSpeed) {

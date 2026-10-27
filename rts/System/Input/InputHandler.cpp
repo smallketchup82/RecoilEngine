@@ -3,6 +3,12 @@
 #include "InputHandler.h"
 #include "System/TimeProfiler.h"
 
+#ifdef __APPLE__
+#include "System/Platform/Mac/Keyboard.h"
+#include "System/Platform/Mac/Trackpad.h"
+#include "System/Config/ConfigHandler.h"
+#endif
+
 InputHandler input;
 
 InputHandler::InputHandler() = default;
@@ -23,9 +29,18 @@ void InputHandler::PushEvents()
 
 	SDL_Event event;
 
+#ifdef __APPLE__
+	MacTrackpad::SetEnabled(configHandler->GetBool("MacTrackpadEnabled"));
+#endif
+
 	while (SDL_PollEvent(&event)) {
 		// SDL_PollEvent may modify FPU flags
 		streflop::streflop_init<streflop::Simple>();
+#ifdef __APPLE__
+		MacKeyboard::TranslateEvent(event);
+		if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+			MacTrackpad::Reset();
+#endif
 		PushEvent(event);
 	}
 }

@@ -65,6 +65,13 @@ CONFIG(float, CrossMoveScale).defaultValue(1.0f);
 CONFIG(float, DoubleClickTime).defaultValue(200.0f).description("Double click time in milliseconds.");
 CONFIG(float, ScrollWheelSpeed).defaultValue(-25.0f).minimumValue(-255.f).maximumValue(255.f);
 
+CONFIG(bool, MacTrackpadEnabled).defaultValue(false).description("Use macOS trackpad scroll to pan, pinch to zoom, and three-finger movement or Option-scroll to tilt. Mouse wheels and buttons retain their normal behavior.");
+CONFIG(float, MacTrackpadPanSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
+CONFIG(float, MacTrackpadZoomSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
+CONFIG(float, MacTrackpadTiltSpeed).defaultValue(1.0f).minimumValue(0.05f).maximumValue(10.0f);
+CONFIG(bool, MacTrackpadInvertPan).defaultValue(false).description("Reverse trackpad camera panning relative to macOS natural scrolling.");
+CONFIG(bool, MacTrackpadMomentum).defaultValue(false).description("Allow camera panning to continue with trackpad momentum. UI scrolling always retains momentum.");
+
 CONFIG(float, MouseDragScrollThreshold).defaultValue(0.3f);
 CONFIG(int, MouseDragSelectionThreshold).defaultValue(4).description("Distance in pixels which the mouse must be dragged to trigger a selection box.");
 CONFIG(int, MouseDragCircleCommandThreshold).defaultValue(4).description("Distance in pixels which the mouse must be dragged to trigger a circular area command.");
@@ -89,9 +96,7 @@ CMouseHandler::CMouseHandler()
 
 	UpdateCursorCameraDir();
 
-#ifndef __APPLE__
 	hardwareCursor = configHandler->GetBool("HardwareCursor");
-#endif
 
 	crossSize      = configHandler->GetFloat("CrossSize");
 	crossAlpha     = configHandler->GetFloat("CrossAlpha");
@@ -236,6 +241,7 @@ void CMouseHandler::WindowLeave()
 {
 	RECOIL_DETAILED_TRACY_ZONE;
 	offscreen = true;
+	std::fill(std::begin(trackpadTargets), std::end(trackpadTargets), 0);
 
 	const int2 viewMouseCenter = GetViewMouseCenter();
 
@@ -647,7 +653,7 @@ bool CMouseHandler::ButtonPressed()
 	return pressedBitMask > 0;
 }
 
-void CMouseHandler::MouseWheel(float delta)
+void CMouseHandler::MouseWheel(float delta, bool moveCamera)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
 	if (RmlGui::ProcessMouseWheel(delta)) {
@@ -657,12 +663,75 @@ void CMouseHandler::MouseWheel(float delta)
 	if (eventHandler.MouseWheel(delta > 0.0f, delta))
 		return;
 
+	if (!moveCamera)
+		return;
+
 	if (miniMapMouseWheel && (minimap != nullptr) && minimap->IsInside(mouse->lastx, mouse->lasty)) {
 		minimap->MouseWheel(delta > 0.0f, delta);
 		return;
 	}
 
 	camHandler->GetCurrentController().MouseWheelMove(delta * scrollWheelSpeed);
+}
+
+void CMouseHandler::TrackpadGesture(TrackpadAction action, float x, float y, bool begin, bool end, bool momentum)
+{
+	if (!configHandler->GetBool("MacTrackpadEnabled"))
+		return;
+
+	int& target = trackpadTargets[static_cast<int>(action)];
+	if (begin || target == 0) {
+		if (!globalRendering->active || offscreen || ButtonPressed() || locked) {
+			target = 3;
+		} else if (game == nullptr || activeController != game || guihandler == nullptr || CInputReceiver::GetReceiverAt(lastx, lasty) != nullptr) {
+			target = 2;
+		} else {
+			target = 1;
+		}
+	}
+
+	if (target == 2 && action == TrackpadAction::Pan && y != 0.0f) {
+		// Cocoa's precise deltas are pixels; SDL uses roughly 10 pixels per notch.
+		// The UI owns the whole sequence, including its momentum tail.
+		MouseWheel(y * 0.1f, false);
+	} else if (target == 1 && (x != 0.0f || y != 0.0f) && globalRendering->active && !offscreen && !ButtonPressed() && !locked && camHandler != nullptr &&
+		(!momentum || configHandler->GetBool("MacTrackpadMomentum"))) {
+		auto& controller = camHandler->GetCurrentController();
+		CCamera* activeCamera = camHandler->GetActiveCamera();
+		const bool rotate = activeCamera->GetMovState()[CCamera::MOVE_STATE_RTT];
+		const bool tilt = activeCamera->GetMovState()[CCamera::MOVE_STATE_TLT];
+		const bool reset = activeCamera->GetMovState()[CCamera::MOVE_STATE_RST];
+		// A held modifier must not turn a pinch into tilt or instant zoom.
+		activeCamera->SetMovState(CCamera::MOVE_STATE_RTT, false);
+		activeCamera->SetMovState(CCamera::MOVE_STATE_TLT, action == TrackpadAction::Tilt);
+		activeCamera->SetMovState(CCamera::MOVE_STATE_RST, false);
+
+		switch (action) {
+			case TrackpadAction::Pan: {
+				const float speed = configHandler->GetFloat("MacTrackpadPanSpeed") * (configHandler->GetBool("MacTrackpadInvertPan") ? -1.0f : 1.0f);
+				controller.MouseMove(float3(x * speed, y * speed, 1.0f));
+				break;
+			}
+			case TrackpadAction::Pinch: {
+				const float scale = std::clamp(1.0f + y * configHandler->GetFloat("MacTrackpadZoomSpeed"), 0.5f, 2.0f);
+				controller.MouseWheelMove((1.0f / scale - 1.0f) / 0.007f, dir);
+				break;
+			}
+			case TrackpadAction::Tilt:
+				controller.MouseWheelMove(y * configHandler->GetFloat("MacTrackpadTiltSpeed"), dir);
+				break;
+		}
+
+		activeCamera->SetMovState(CCamera::MOVE_STATE_RTT, rotate);
+		activeCamera->SetMovState(CCamera::MOVE_STATE_TLT, tilt);
+		activeCamera->SetMovState(CCamera::MOVE_STATE_RST, reset);
+		unitTracker.Disable();
+	}
+
+	// Pan retains ownership across phase=Ended until the momentum tail ends.
+	// A new phase=Began always chooses its route again.
+	if (end && action != TrackpadAction::Pan)
+		target = 0;
 }
 
 
