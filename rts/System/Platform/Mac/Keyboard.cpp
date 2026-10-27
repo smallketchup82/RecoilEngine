@@ -223,6 +223,9 @@ void Init()
 	if (app == nullptr)
 		return;
 
+	// The bundle bootstrap is an agent; only the engine owns a Dock entry.
+	Send<bool>(app, "setActivationPolicy:", long(0));
+
 	commandAsCtrl = configHandler->GetBool("MacCommandAsCtrl");
 
 	if (sdlSendEvent == nullptr)

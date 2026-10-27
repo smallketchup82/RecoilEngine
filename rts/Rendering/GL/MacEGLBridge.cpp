@@ -85,10 +85,12 @@ namespace {
 	std::mutex surfMutex;
 
 	// a Mesa tree shipped next to the engine binary takes precedence over the system one
-	const std::string& MesaPrefix() {
+	const std::string& MesaLibraryDirectory() {
 		static const std::string prefix = []() -> std::string {
-			const std::string bundled = Platform::GetProcessExecutablePath() + "mesa";
-			return FileSystem::FileExists(bundled + "/lib/libEGL.1.dylib") ? bundled : MAC_MESA_PREFIX;
+			const std::string bundled = Platform::GetProcessExecutablePath() + "../Frameworks";
+			if (FileSystem::FileExists(bundled + "/libEGL.1.dylib")) return bundled;
+			const char* developmentPrefix = std::getenv("RECOIL_MESA_PREFIX");
+			return developmentPrefix != nullptr ? std::string(developmentPrefix) + "/lib" : Platform::GetProcessExecutablePath() + "mesa/lib";
 		}();
 		return prefix;
 	}
@@ -97,7 +99,7 @@ namespace {
 		if (egl.lib != nullptr)
 			return true;
 
-		if ((egl.lib = dlopen((MesaPrefix() + "/lib/libEGL.1.dylib").c_str(), RTLD_NOW | RTLD_LOCAL)) == nullptr) {
+		if ((egl.lib = dlopen((MesaLibraryDirectory() + "/libEGL.1.dylib").c_str(), RTLD_NOW | RTLD_LOCAL)) == nullptr) {
 			LOG_L(L_ERROR, "[MacEGLBridge] could not load Mesa libEGL (%s)", dlerror());
 			return false;
 		}
@@ -126,7 +128,8 @@ namespace {
 
 		// Zink needs robustness2.nullDescriptor, which MoltenVK lacks, so the loader gets KosmicKrisp
 		if (getenv("VK_ICD_FILENAMES") == nullptr && getenv("VK_DRIVER_FILES") == nullptr) {
-			const std::string icd = MesaPrefix() + "/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json";
+			const std::string bundled = Platform::GetProcessExecutablePath() + "../Resources/kosmickrisp_mesa_icd.aarch64.json";
+			const std::string icd = FileSystem::FileExists(bundled) ? bundled : MesaLibraryDirectory() + "/../share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json";
 			setenv("VK_DRIVER_FILES", icd.c_str(), 0);
 		}
 
