@@ -111,7 +111,8 @@ void Touches(id self, SEL selector, id event)
 			center.x /= 3;
 			center.y /= 3;
 			if (tilting && identities == previousTouches) {
-				Push(Action::Tilt, 0, float(center.y - previousCenter.y) * 800.0f);
+				// NSTouch positions increase upward, opposite to trackpad scroll deltas.
+				Push(Action::Tilt, 0, float(previousCenter.y - center.y) * 800.0f);
 			} else {
 				FinishTilt();
 				Push(Action::Tilt, 0, 0, true);
