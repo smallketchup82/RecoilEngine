@@ -1,3 +1,5 @@
+/* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
+
 #include "ModelDrawerHelpers.h"
 #include "ModelDrawer.h"
 #include "System/float3.h"
@@ -16,6 +18,12 @@
 bool CModelDrawerHelper::ObjectVisibleReflection(const float3& objPos, const float3& camPos, float maxRadius)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
+#if defined(__APPLE__) && defined(MAC_EGL_ZINK)
+	// A single approximate terrain sample can reject an entire tree at cliffs
+	// as the camera moves. Keep frustum culling; let the reflection depth buffer
+	// resolve occlusion instead of dropping the object's whole reflection.
+	return true;
+#else
 #if 1
 	// If the object is underwater then,
 	// draw the object if the water depth at the object is less than the units draw radius
@@ -35,6 +43,7 @@ bool CModelDrawerHelper::ObjectVisibleReflection(const float3& objPos, const flo
 	// and prevents units over water depth > 2 * radius  to have any reflection at all
 	const float gh = CGround::GetApproximateHeight(objPos.x, objPos.z, false);
 	return gh + 2.0f * maxRadius > 0.0f;
+#endif
 #endif
 }
 

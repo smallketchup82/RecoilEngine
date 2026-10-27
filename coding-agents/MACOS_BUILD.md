@@ -1,6 +1,19 @@
 # Building and running Recoil on macOS
 
-Apple Silicon only, macOS 15 or newer. Most of the first build is compiling Mesa.
+## Zero-K macOS integration branch
+The `macos/2026.07.04` branch applies the macOS renderer integration to the
+actual July engine required by Zero-K. It also includes native trackpad input,
+Retina UI and scene modes, a native FPS counter, forced VSync, and bundle-relative
+graphics resources. The build orchestration and version pins live in
+[ZkMacOS](https://github.com/smallketchup82/ZkMacOS).
+
+The Zero-K integration changes were developed with OpenAI Codex assistance.
+The earlier integration notes and measurements below describe the original
+macOS renderer work; they are not new measurements of this Zero-K build.
+
+## Original renderer notes
+
+Apple Silicon only, macOS 26 or newer (the selected KosmicKrisp build requires Metal 4). Most of the first build is compiling Mesa.
 
 macOS has no OpenGL 4.6. Apple froze its driver at 4.1 core, and the engine needs 4.6 compatibility. So the graphical engine runs on Mesa's Zink, which translates OpenGL to Vulkan, on top of KosmicKrisp, which is Mesa's Vulkan driver for Metal.
 

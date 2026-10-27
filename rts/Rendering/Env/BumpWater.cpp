@@ -16,6 +16,7 @@
 #include "Map/MapInfo.h"
 #include "Map/ReadMap.h"
 #include "Rendering/GlobalRendering.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "Rendering/ShadowHandler.h"
 #include "Rendering/Map/InfoTexture/IInfoTextureHandler.h"
 #include "Rendering/Shaders/ShaderHandler.h"
@@ -203,6 +204,12 @@ CBumpWater::~CBumpWater()
 void CBumpWater::InitResources(bool loadShader)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
+	screenTextureX = globalRendering->viewSizeX;
+	screenTextureY = globalRendering->viewSizeY;
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	// gl_FragCoord and these screen copies must use the same pixel dimensions.
+	MacEGLBridge::ScaleSceneSize(screenTextureX, screenTextureY);
+#endif
 	// LOAD USER CONFIGS
 	reflTexSize  = std::bit_ceil <uint32_t> (configHandler->GetInt("BumpWaterTexSizeReflection"));
 	reflection   = configHandler->GetInt("BumpWaterReflection");
@@ -422,9 +429,7 @@ void CBumpWater::InitResources(bool loadShader)
 	if (endlessOcean) definitions += "#define opt_endlessocean\n";
 
 	GLSLDefineConstf3(definitions, "MapMid",                    float3(mapDims.mapx * SQUARE_SIZE * 0.5f, 0.0f, mapDims.mapy * SQUARE_SIZE * 0.5f));
-	GLSLDefineConstf2(definitions, "ScreenInverse",             1.0f / globalRendering->viewSizeX, 1.0f / globalRendering->viewSizeY);
-	GLSLDefineConstf2(definitions, "ScreenTextureSizeInverse",  1.0f / screenTextureX, 1.0f / screenTextureY);
-	GLSLDefineConstf2(definitions, "ViewPos",                   globalRendering->viewPosX, globalRendering->viewPosY);
+	definitions += "uniform vec2 ScreenInverse;\nuniform vec2 ScreenTextureSizeInverse;\nuniform vec2 ViewPos;\n";
 
 	GLSLDefineConstf4(definitions, "SurfaceColor",   waterRendering->surfaceColor*0.4, waterRendering->surfaceAlpha );
 	GLSLDefineConstf4(definitions, "PlaneColor",     waterRendering->planeColor*0.4, waterRendering->surfaceAlpha );
@@ -900,16 +905,47 @@ void CBumpWater::Draw()
 	if (!waterRendering->forceRendering && !readMap->HasVisibleWater())
 		return;
 
+	int viewSizeX = globalRendering->viewSizeX;
+	int viewSizeY = globalRendering->viewSizeY;
+	int viewPosX = globalRendering->viewPosX;
+	int viewPosY = globalRendering->viewPosY;
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+	MacEGLBridge::ScaleSceneSize(viewSizeX, viewSizeY);
+	MacEGLBridge::ScaleSceneSize(viewPosX, viewPosY);
+#endif
+	if (screenTextureX != viewSizeX || screenTextureY != viewSizeY) {
+		screenTextureX = viewSizeX;
+		screenTextureY = viewSizeY;
+		if (refraction == 1) {
+			glBindTexture(target, refractTexture);
+			glTexImage2D(target, 0, GL_RGBA8, screenTextureX, screenTextureY, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		}
+		if (depthCopy) {
+			glBindTexture(target, depthTexture);
+			const GLuint format = CGlobalRendering::DepthBitsToFormat(globalRendering->supportDepthBufferBitDepth);
+			glTexImage2D(target, 0, format, screenTextureX, screenTextureY, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+		}
+	}
+
+	const auto copyScreen = [&]() {
+#ifdef MAC_EGL_BRIDGE_AVAILABLE
+		// Bypass logical-size readback: both color and depth are scene pixels.
+		MacEGLBridge::CopyToTexturePixels(target, 0, 0, 0, viewPosX, viewPosY, screenTextureX, screenTextureY);
+#else
+		glCopyTexSubImage2D(target, 0, 0, 0, viewPosX, viewPosY, screenTextureX, screenTextureY);
+#endif
+	};
+
 	if (refraction == 1) {
 		// _SCREENCOPY_ REFRACT TEXTURE
 		glBindTexture(target, refractTexture);
-		glCopyTexSubImage2D(target, 0, 0, 0, globalRendering->viewPosX, globalRendering->viewPosY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+		copyScreen();
 	}
 
 	if (depthCopy) {
 		// _SCREENCOPY_ DEPTH TEXTURE
 		glBindTexture(target, depthTexture);
-		glCopyTexSubImage2D(target, 0, 0, 0, globalRendering->viewPosX, globalRendering->viewPosY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+		copyScreen();
 	}
 
 	glDisable(GL_ALPHA_TEST);
@@ -929,6 +965,9 @@ void CBumpWater::Draw()
 	waterShader->SetFlag("opt_infotex", infoTextureHandler->IsEnabled());
 
 	waterShader->Enable();
+	waterShader->SetUniform("ScreenInverse", 1.0f / viewSizeX, 1.0f / viewSizeY);
+	waterShader->SetUniform("ScreenTextureSizeInverse", 1.0f / screenTextureX, 1.0f / screenTextureY);
+	waterShader->SetUniform("ViewPos", float(viewPosX), float(viewPosY));
 	waterShader->SetUniform("eyePos", camera->GetPos().x, camera->GetPos().y, camera->GetPos().z);
 	waterShader->SetUniform("frame", (gs->frameNum + globalRendering->timeOffset) / 15000.0f);
 

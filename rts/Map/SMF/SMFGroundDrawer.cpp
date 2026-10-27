@@ -227,10 +227,9 @@ void CSMFGroundDrawer::DrawDeferredPass(const DrawPass::e& drawPass, bool alphaT
 		return;
 	}
 
-	GL::GeometryBuffer::LoadViewport();
-
 	{
 		geomBuffer.Bind();
+		GL::GeometryBuffer::LoadViewport();
 		geomBuffer.SetDepthRange(1.0f, 0.0f);
 		geomBuffer.Clear();
 
