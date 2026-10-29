@@ -1,7 +1,6 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
-#ifndef WINDOW_MANAGER_HELPER_H
-#define WINDOW_MANAGER_HELPER_H
+#pragma once
 
 #include <string>
 
@@ -37,6 +36,9 @@ namespace WindowManagerHelper {
 	 * @brief returns the window-state of the given window in SDL_GetWindowFlags() format
 	 */
 	void SetWindowResizable(SDL_Window* window, bool resizable);
+#ifdef __APPLE__
+	void AddUpdateMenuItem();
+	// Logical notch boundaries, only when fullscreen includes the camera area.
+	bool GetMacNotchGeometry(SDL_Window* window, double& left, double& right, double& height);
+#endif
 };
-
-#endif // WINDOW_MANAGER_HELPER_H

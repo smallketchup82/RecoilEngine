@@ -53,6 +53,7 @@
 #include "Rendering/Fonts/FontHandler.h"
 #include "Rendering/Fonts/glFont.h"
 #include "Rendering/GL/FBO.h"
+#include "Rendering/GL/MacEGLBridge.h"
 #include "Rendering/Models/ModelsMemStorage.h"
 #include "Rendering/GL/RenderBuffers.h"
 #include "Rendering/Shaders/ShaderHandler.h"
@@ -928,6 +929,10 @@ int SpringApp::Run()
 
 		while (!gu->globalQuit) {
 			Watchdog::ClearTimer(WDT_MAIN);
+			#ifdef MAC_EGL_BRIDGE_AVAILABLE
+			// Wait before polling input so a display-paced frame uses fresh events.
+			MacEGLBridge::WaitForFrame();
+			#endif
 			input.PushEvents();
 
 			// move to clear global data if a save is queued
@@ -1149,10 +1154,13 @@ bool SpringApp::MainEventHandler(const SDL_Event& event)
 						sound->Iconified(false);
 					}
 
+					// The offscreen Mesa context survives Cocoa fullscreen and hide/show.
+#ifndef MAC_EGL_BRIDGE_AVAILABLE
 					if (globalRendering->fullScreen) {
 						SCOPED_ONCE_TIMER("FBO::GLContextReinit");
 						FBO::GLContextReinit();
 					}
+#endif
 
 					LOG("[SpringApp::%s][SDL_WINDOWEVENT_SHOWN][2]\n", __func__);
 				} break;
@@ -1169,10 +1177,12 @@ bool SpringApp::MainEventHandler(const SDL_Event& event)
 						sound->Iconified(true);
 					}
 
+#ifndef MAC_EGL_BRIDGE_AVAILABLE
 					if (globalRendering->fullScreen) {
 						SCOPED_ONCE_TIMER("FBO::GLContextLost");
 						FBO::GLContextLost();
 					}
+#endif
 
 					LOG("[SpringApp::%s][SDL_WINDOWEVENT_HIDDEN][2]\n", __func__);
 				} break;

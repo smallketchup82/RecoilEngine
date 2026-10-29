@@ -75,6 +75,7 @@ CONFIG(bool, TeamNanoSpray).defaultValue(true).headlessValue(false);
 
 CONFIG(int, MinimizeOnFocusLoss).defaultValue(0).minimumValue(0).maximumValue(1).description("When set to 1 minimize Window if it loses key focus when in fullscreen mode.");
 
+CONFIG(bool, MacNotchFullscreen).defaultValue(false).description("Allow fullscreen to cover the macOS camera housing area; the resource HUD adapts automatically. Requires restart.");
 CONFIG(bool, Fullscreen).defaultValue(true).headlessValue(false).description("Sets whether the game will run in fullscreen, as opposed to a window. For Windowed Fullscreen of Borderless Window, set this to 0, WindowBorderless to 1, and WindowPosX and WindowPosY to 0.");
 CONFIG(bool, WindowBorderless).defaultValue(false).description("When set and Fullscreen is 0, will put the game in Borderless Window mode, also known as Windowed Fullscreen. When using this, it is generally best to also set WindowPosX and WindowPosY to 0");
 CONFIG(bool, BlockCompositing).defaultValue(false).safemodeValue(true).description("Disables kwin compositing to fix tearing, possible fixes low FPS in windowed mode, too.");
@@ -574,6 +575,9 @@ bool CGlobalRendering::CreateWindowAndContext(const char* title)
 {
 #ifdef __APPLE__
 	MacKeyboard::DisableAutoFill();
+	// Custom desktop fullscreen includes the menu-bar area on notched displays.
+	if (configHandler->GetBool("MacNotchFullscreen"))
+		SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
 #endif
 
 	if (SDL_Init(SDL_INIT_VIDEO) == -1) {
@@ -646,6 +650,10 @@ bool CGlobalRendering::CreateWindowAndContext(const char* title)
 	// vsync too, resulting in bad performance.
 	if (configHandler->GetBool("BlockCompositing"))
 		WindowManagerHelper::BlockCompositing(sdlWindow);
+#endif
+
+#ifdef __APPLE__
+	WindowManagerHelper::AddUpdateMenuItem();
 #endif
 
 	if ((glContext = CreateGLContext(minCtx)) == nullptr)
@@ -1340,8 +1348,21 @@ void CGlobalRendering::SetWindowAttributes(SDL_Window* window)
 	GetWindowPosSizeBounded(winPosX, winPosY, newRes.x, newRes.y);
 	LOG("[GR::%s][2] cfgFullScreen=%d numDisplays=%d winPos=<%d,%d> newRes=<%d,%d>", __func__, fullScreen, numDisplays, winPosX, winPosY, newRes.x, newRes.y);
 
-//	if (SDL_SetWindowFullscreen(window, 0) != 0)
-//		LOG("[GR::%s][3][SDL_SetWindowFullscreen] err=\"%s\"", __func__, SDL_GetError());
+#ifdef __APPLE__
+	// Desktop fullscreen owns its geometry. Reapplying windowed coordinates or
+	// maximizing here disturbs Spaces and overwrites SDL's restore rectangle.
+	const bool sdlFullScreen = fullScreen || IsBorderlessFullScreen(borderless, winPosX, winPosY, newRes.x, newRes.y);
+	const uint32_t currentFullScreen = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+	const uint32_t wantedFullScreen = sdlFullScreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+
+	if (currentFullScreen != wantedFullScreen && SDL_SetWindowFullscreen(window, wantedFullScreen) != 0) {
+		LOG_L(L_WARNING, "[GR::%s][SDL_SetWindowFullscreen] err=\"%s\"", __func__, SDL_GetError());
+		return;
+	}
+
+	if (sdlFullScreen)
+		return;
+#endif
 
 	SDL_RestoreWindow(window);
 	SDL_SetWindowMinimumSize(window, minRes.x, minRes.y);
@@ -1349,10 +1370,12 @@ void CGlobalRendering::SetWindowAttributes(SDL_Window* window)
 	SDL_SetWindowPosition(window, winPosX, winPosY);
 	SDL_SetWindowSize(window, newRes.x, newRes.y);
 
+#ifndef __APPLE__
 	const bool sdlFullScreen = fullScreen || IsBorderlessFullScreen(borderless, winPosX, winPosY, newRes.x, newRes.y);
 
 	if (SDL_SetWindowFullscreen(window, GetFullScreenFlag(borderless) * sdlFullScreen) != 0)
 		LOG("[GR::%s][4][SDL_SetWindowFullscreen] err=\"%s\"", __func__, SDL_GetError());
+#endif
 
 	SDL_SetWindowBordered(window, borderless ? SDL_FALSE : SDL_TRUE);
 
@@ -1696,6 +1719,13 @@ void CGlobalRendering::SaveWindowPosAndSize()
 
 	if (fullScreen)
 		return;
+
+#ifdef __APPLE__
+	// Also covers native titlebar fullscreen and promoted borderless windows,
+	// where the Fullscreen config can still be false.
+	if ((SDL_GetWindowFlags(sdlWindow) & SDL_WINDOW_FULLSCREEN) != 0)
+		return;
+#endif
 
 	// do not save if minimized
 	// note that maximized windows are automagically restored; SDL2

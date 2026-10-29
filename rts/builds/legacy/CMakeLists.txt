@@ -86,6 +86,18 @@ include_directories(${engineIncludes})
 
 ### Build the executable
 add_executable(engine-legacy ${EXE_FLAGS} ${engineSources} ${ENGINE_ICON} ${engineHeaders})
+if (APPLE AND MAC_EGL_ZINK)
+	# Keep GCC for synchronized engine code; compile only the Metal API boundary with Clang.
+	set(metalfx_source "${ENGINE_SRC_ROOT_DIR}/Rendering/GL/MacMetalFX.mm")
+	set(metalfx_object "${CMAKE_CURRENT_BINARY_DIR}/MacMetalFX.o")
+	add_custom_command(OUTPUT "${metalfx_object}"
+		COMMAND xcrun clang++ -std=c++17 -O2 -g -fobjc-arc -arch arm64 -mmacosx-version-min=26.0
+			-DMAC_EGL_ZINK -c "${metalfx_source}" -o "${metalfx_object}"
+		DEPENDS "${metalfx_source}" "${ENGINE_SRC_ROOT_DIR}/Rendering/GL/MacEGLBridge.h"
+		VERBATIM)
+	target_sources(engine-legacy PRIVATE "${metalfx_object}")
+	target_link_libraries(engine-legacy "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework AppKit")
+endif ()
 target_link_libraries(engine-legacy ${engineLibraries} Game)
 
 # Export symbols for plugin access (replaces CMP0065 OLD behavior)

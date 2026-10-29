@@ -10,8 +10,8 @@
 	branch = barbarian
 [submodule "AI/Skirmish/CircuitAI"]
 	path = AI/Skirmish/CircuitAI
-	url = https://github.com/rlcevg/CircuitAI.git
-	branch = zk
+	url = https://github.com/smallketchup82/CircuitAI.git
+	branch = codex/macos-arm64
 [submodule "rts/lib/tracy"]
 	path = rts/lib/tracy
 	url = https://github.com/wolfpld/tracy.git

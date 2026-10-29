@@ -1,6 +1,7 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
 
 #include "LuaUnsyncedRead.h"
+#include "System/Platform/WindowManagerHelper.h"
 
 #include "LuaConfig.h"
 #include "LuaInclude.h"
@@ -128,6 +129,7 @@ bool LuaUnsyncedRead::PushEntries(lua_State* L)
 	REGISTER_LUA_CFUNC(GetViewGeometry);
 	REGISTER_LUA_CFUNC(GetDualViewGeometry);
 	REGISTER_LUA_CFUNC(GetWindowGeometry);
+	REGISTER_LUA_CFUNC(GetMacNotchGeometry);
 	REGISTER_LUA_CFUNC(GetWindowDisplayMode);
 	REGISTER_LUA_CFUNC(GetScreenGeometry);
 	REGISTER_LUA_CFUNC(GetMiniMapGeometry);
@@ -943,6 +945,22 @@ int LuaUnsyncedRead::GetWindowGeometry(lua_State* L)
 	lua_pushnumber(L, globalRendering->winBorder[2]);
 	lua_pushnumber(L, globalRendering->winBorder[3]);
 	return 4 + 4;
+}
+
+// No values in windowed mode, below-notch fullscreen, or on non-notched displays.
+int LuaUnsyncedRead::GetMacNotchGeometry(lua_State* L)
+{
+#ifdef __APPLE__
+	double left, right, height;
+	if (!WindowManagerHelper::GetMacNotchGeometry(globalRendering->GetWindow(), left, right, height))
+		return 0;
+	lua_pushnumber(L, left);
+	lua_pushnumber(L, right);
+	lua_pushnumber(L, height);
+	return 3;
+#else
+	return 0;
+#endif
 }
 
 /*** Get main window display mode

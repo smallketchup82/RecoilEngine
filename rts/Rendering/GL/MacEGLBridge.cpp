@@ -12,16 +12,24 @@
 #include <string>
 #include <mutex>
 #include <cmath>
+#include <vector>
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 
 #include "Rendering/GL/myGL.h"
+#include "Rendering/GlobalRendering.h"
 #include "System/FileSystem/FileSystem.h"
 #include "System/Log/ILog.h"
 #include "System/Platform/Misc.h"
 #include "System/Config/ConfigHandler.h"
 
 CONFIG(int, MacRetinaMode).defaultValue(1).minimumValue(0).maximumValue(2).description("macOS Retina mode: 0=standard, 1=Retina text and UI, 2=Retina text, UI and main game scene. Requires restart.");
+CONFIG(bool, MacMetalFXSpatial).defaultValue(false).description("Use MetalFX spatial upscaling for the lower-resolution world in Retina text and UI mode. Applies immediately; UI stays native resolution. Uses shared GPU textures when available, with a CPU staging compatibility path.");
+CONFIG(bool, MacHDR).defaultValue(false).description("macOS HDR display output for the game's existing HDR lighting. Preserves floating-point scene values without extra bloom or color grading. Applies immediately; UI white remains SDR. Requires GPU sharing and an HDR display.");
+CONFIG(bool, MacGPUSharing).defaultValue(false).description("Experimental sharing of bundled Mesa GPU textures with MetalFX and Metal presentation. Applies immediately. Disabled by default while synchronization performance is evaluated.");
+
+CONFIG(bool, MacDisplayLink).defaultValue(false).description("Experimental macOS frame pacing with CAMetalDisplayLink before polling input. Disabled by default pending consistent performance improvements.");
 
 // minimal EGL declarations; libEGL is dlopen()ed so there is no build-time dependency on Mesa
 namespace {
@@ -75,6 +83,37 @@ namespace {
 	SDL_Window* presenterWindow = nullptr;
 	bool retinaEnabled = false;
 	int retinaMode = 0;
+	bool sharedUpscaleFailed = false;
+	bool sharedPresentFailed = false;
+	bool sharedPresentLogged = false;
+	bool presentedSharedLastFrame = false;
+	bool displayLinkLogged = false;
+	bool pixelPresentFailed = false;
+	bool pixelPresentLogged = false;
+
+	bool hdrFrame = false, hdrFailed = false, hdrLogged = false;
+	bool hdrSceneDrawn = false, previousHDRRequest = false, hdrUnavailableLogged = false;
+	float loggedHDRHeadroom = 0.0f;
+
+	void* NativeWindow() {
+		SDL_SysWMinfo info = {};
+		SDL_VERSION(&info.version);
+		if (!SDL_GetWindowWMInfo(presenterWindow, &info) || info.subsystem != SDL_SYSWM_COCOA)
+			return nullptr;
+		return info.info.cocoa.window;
+	}
+
+	using GetVkColorBuffer = bool (*)(void**, uint64_t*);
+	using GetMetalTexture = bool (*)(void*, uint64_t, void**, void**);
+	GetVkColorBuffer getVkColorBuffer = nullptr;
+	GetMetalTexture getMetalTexture = nullptr;
+	using GetMetalQueue = void* (*)(void*);
+	GetMetalQueue getMetalQueue = nullptr;
+	bool (*flushGPU)() = nullptr;
+	bool sharedEventsLogged = false;
+	bool sharedGPUWasEnabled = false;
+	void* sharedDriver = nullptr;
+	bool sharingChecked = false;
 
 	constexpr unsigned int NUM_PBOS = 2;
 	GLuint pbos[NUM_PBOS] = {};
@@ -123,6 +162,55 @@ namespace {
 		return (egl.GetPlatformDisplayEXT != nullptr && egl.Initialize != nullptr && egl.CreateContext != nullptr && egl.MakeCurrent != nullptr);
 	}
 
+	bool SharedExportsAvailable() {
+		if (!sharingChecked) {
+			sharingChecked = true;
+			getVkColorBuffer = reinterpret_cast<GetVkColorBuffer>(dlsym(egl.lib, "recoil_mesa_get_vk_color_buffer_v1"));
+			flushGPU = reinterpret_cast<decltype(flushGPU)>(dlsym(egl.lib, "recoil_mesa_flush_gpu_v1"));
+			// Only use the ICD already loaded from this same Mesa bundle.
+			sharedDriver = dlopen((MesaLibraryDirectory() + "/libvulkan_kosmickrisp.dylib").c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+			if (sharedDriver) {
+				getMetalTexture = reinterpret_cast<GetMetalTexture>(dlsym(sharedDriver, "recoil_kk_get_metal_texture_v1"));
+				getMetalQueue = reinterpret_cast<GetMetalQueue>(dlsym(sharedDriver, "recoil_kk_get_metal_queue_v1"));
+			}
+		}
+		return getVkColorBuffer && getMetalTexture;
+	}
+
+	bool UseSharedGPU() {
+		if (configHandler->GetBool("MacGPUSharing") || hdrFrame) {
+			sharedGPUWasEnabled = true;
+			return true;
+		}
+		if (sharedGPUWasEnabled)
+			MacMetalFX::WaitShared();
+		sharedGPUWasEnabled = false;
+		sharedUpscaleFailed = sharedPresentFailed = false;
+		sharedPresentLogged = false;
+		return false;
+	}
+
+	bool GetSharedColorBuffer(void*& device, void*& nativeTexture, void** nativeQueue = nullptr) {
+		void* vkDevice = nullptr;
+		uint64_t image = 0;
+		if (!getVkColorBuffer(&vkDevice, &image) || !getMetalTexture(vkDevice, image, &device, &nativeTexture))
+			return false;
+		if (nativeQueue)
+			*nativeQueue = getMetalQueue ? getMetalQueue(vkDevice) : nullptr;
+		return true;
+	}
+
+	void* SubmitSharedGPU(void* nativeQueue) {
+		if (nativeQueue && flushGPU && flushGPU()) {
+			if (!sharedEventsLogged)
+				LOG("[MacGPUSharing] GPU event synchronization enabled; no per-frame CPU completion waits");
+			sharedEventsLogged = true;
+			return nativeQueue;
+		}
+		glFinish();
+		return nullptr;
+	}
+
 	void SetupEnvironment() {
 		setenv("GALLIUM_DRIVER", "zink", 0);
 
@@ -139,6 +227,8 @@ namespace {
 	}
 
 	bool CreateSurface(int sx, int sy) {
+		MacMetalFX::WaitShared();
+		pixelPresentFailed = false;
 		sx = std::max(sx, 1);
 		sy = std::max(sy, 1);
 
@@ -318,23 +408,38 @@ namespace Retina {
 	PFNGLBLITFRAMEBUFFERPROC blitFramebuffer = nullptr;
 	PFNGLCOPYTEXSUBIMAGE2DPROC copyTexSubImage2D = nullptr;
 	PFNGLREADPIXELSPROC readPixels = nullptr;
+	PFNGLREADBUFFERPROC readBuffer = nullptr;
+	PFNGLDRAWBUFFERPROC drawBuffer = nullptr;
+	PFNGLDRAWBUFFERSPROC drawBuffers = nullptr;
 
 	GLuint sceneFBO = 0;
 	GLuint sceneColor = 0;
 	GLuint sceneDepth = 0;
 	int sceneX = 0, sceneY = 0;
+	bool sceneHDR = false;
+	GLuint hdrFBO = 0, hdrColor = 0, hdrDepth = 0;
+	int hdrX = 0, hdrY = 0;
+	GLuint logicalReadFBO = 0, logicalReadColor = 0;
+	int logicalReadX = 0, logicalReadY = 0;
+	GLint vertexClamp = GL_TRUE, fragmentClamp = GL_FIXED_ONLY;
 	int logicalX = 1, logicalY = 1;
 	float scaleX = 1.0f, scaleY = 1.0f;
 	bool drawingScene = false;
+	GLuint upscaleFBO = 0, upscaleColor = 0;
+	int upscaleX = 0, upscaleY = 0;
+	std::vector<uint8_t> scenePixels;
+	bool metalFXFailed = false;
+	bool sharedUpscaleLogged = false, cpuUpscaleLogged = false;
 
 	bool HighDPI() { return retinaEnabled && (scaleX > 1.0f || scaleY > 1.0f); }
 
 	bool Scaled(GLenum binding) {
-		if (!HighDPI() || drawingScene || getIntegerv == nullptr)
+		if (!HighDPI() || getIntegerv == nullptr)
 			return false;
 		GLint fbo = 0;
 		getIntegerv(binding, &fbo);
-		return fbo == 0;
+		if (drawingScene) return hdrFrame && retinaMode == 2 && GLuint(fbo) == sceneFBO;
+		return fbo == 0 || (hdrFrame && GLuint(fbo) == hdrFBO);
 	}
 
 	void Viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
@@ -355,6 +460,15 @@ namespace Retina {
 
 	void GetIntegerv(GLenum name, GLint* values) {
 		getIntegerv(name, values);
+		if (hdrFrame && !drawingScene) {
+			if ((name == GL_READ_FRAMEBUFFER_BINDING || name == GL_DRAW_FRAMEBUFFER_BINDING) && GLuint(*values) == hdrFBO)
+				*values = 0;
+			if (name == GL_READ_BUFFER || name == GL_DRAW_BUFFER || name == GL_DRAW_BUFFER0) {
+				GLint fbo = 0;
+				getIntegerv(name == GL_READ_BUFFER ? GL_READ_FRAMEBUFFER_BINDING : GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+				if (GLuint(fbo) == hdrFBO && *values == GL_COLOR_ATTACHMENT0) *values = GL_BACK;
+			}
+		}
 		if ((name == GL_VIEWPORT || name == GL_SCISSOR_BOX) && Scaled(GL_DRAW_FRAMEBUFFER_BINDING)) {
 			values[0] = std::lround(values[0] / scaleX); values[1] = std::lround(values[1] / scaleY);
 			values[2] = std::lround(values[2] / scaleX); values[3] = std::lround(values[3] / scaleY);
@@ -362,7 +476,124 @@ namespace Retina {
 	}
 
 	void BindFramebuffer(GLenum target, GLuint fbo) {
-		bindFramebuffer(target, (drawingScene && fbo == 0 && sceneFBO != 0) ? sceneFBO : fbo);
+		if (fbo == 0) {
+			if (drawingScene && sceneFBO) fbo = sceneFBO;
+			else if (hdrFrame) fbo = hdrFBO;
+		}
+		bindFramebuffer(target, fbo);
+	}
+
+	GLenum ColorBuffer(GLenum buffer, GLenum binding) {
+		if (!hdrFrame || (buffer != GL_BACK && buffer != GL_FRONT && buffer != GL_BACK_LEFT && buffer != GL_FRONT_LEFT))
+			return buffer;
+		GLint fbo = 0;
+		getIntegerv(binding, &fbo);
+		if (GLuint(fbo) == hdrFBO || GLuint(fbo) == sceneFBO)
+			return GL_COLOR_ATTACHMENT0;
+		return buffer;
+	}
+
+	void ReadBuffer(GLenum buffer) { readBuffer(ColorBuffer(buffer, GL_READ_FRAMEBUFFER_BINDING)); }
+	void DrawBuffer(GLenum buffer) { drawBuffer(ColorBuffer(buffer, GL_DRAW_FRAMEBUFFER_BINDING)); }
+	void DrawBuffers(GLsizei count, const GLenum* buffers) {
+		if (!hdrFrame || count <= 0 || !buffers) { drawBuffers(count, buffers); return; }
+		bool needsMapping = false;
+		for (GLsizei i = 0; i < count; ++i)
+			needsMapping |= buffers[i] == GL_BACK || buffers[i] == GL_FRONT || buffers[i] == GL_BACK_LEFT || buffers[i] == GL_FRONT_LEFT;
+		if (!needsMapping) { drawBuffers(count, buffers); return; }
+		std::vector<GLenum> mapped(buffers, buffers + count);
+		for (GLenum& buffer: mapped) buffer = ColorBuffer(buffer, GL_DRAW_FRAMEBUFFER_BINDING);
+		drawBuffers(count, mapped.data());
+	}
+
+	void DestroyHDR() {
+		if (hdrFBO || logicalReadFBO) MacMetalFX::WaitShared();
+		if (logicalReadFBO) glDeleteFramebuffers(1, &logicalReadFBO);
+		if (logicalReadColor) glDeleteRenderbuffers(1, &logicalReadColor);
+		logicalReadFBO = logicalReadColor = 0;
+		logicalReadX = logicalReadY = 0;
+		if (hdrFBO) glDeleteFramebuffers(1, &hdrFBO);
+		if (hdrColor) glDeleteTextures(1, &hdrColor);
+		if (hdrDepth) glDeleteRenderbuffers(1, &hdrDepth);
+		hdrFBO = hdrColor = hdrDepth = 0;
+		hdrX = hdrY = 0;
+	}
+
+	bool EnsureHDR() {
+		if (hdrFBO && hdrX == surfSizeX && hdrY == surfSizeY) return true;
+		GLint read = 0, draw = 0, rbo = 0, tex = 0, unpack = 0;
+		getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+		getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+		getIntegerv(GL_RENDERBUFFER_BINDING, &rbo);
+		getIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+		getIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+		DestroyHDR();
+		glGenFramebuffers(1, &hdrFBO);
+		glGenTextures(1, &hdrColor);
+		glBindTexture(GL_TEXTURE_2D, hdrColor);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, surfSizeX, surfSizeY, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		bindFramebuffer(GL_FRAMEBUFFER, hdrFBO);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hdrColor, 0);
+		glGenRenderbuffers(1, &hdrDepth);
+		glBindRenderbuffer(GL_RENDERBUFFER, hdrDepth);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, surfSizeX, surfSizeY);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hdrDepth);
+		const bool valid = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+		if (valid) {
+			// Establish defined GL contents before Metal writes this allocation.
+			// Otherwise Zink may discard the external writes when UI first draws.
+			const bool clipped = glIsEnabled(GL_SCISSOR_TEST);
+			GLboolean mask[4];
+			glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+			glDisable(GL_SCISSOR_TEST);
+			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+			const GLfloat black[4] = {};
+			glClearBufferfv(GL_COLOR, 0, black);
+			glColorMask(mask[0], mask[1], mask[2], mask[3]);
+			if (clipped) glEnable(GL_SCISSOR_TEST);
+		}
+		bindFramebuffer(GL_READ_FRAMEBUFFER, read);
+		bindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+		glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+		glBindTexture(GL_TEXTURE_2D, tex);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
+		if (!valid) { DestroyHDR(); return false; }
+		hdrX = surfSizeX; hdrY = surfSizeY;
+		return true;
+	}
+
+	bool RenderHDRScene() {
+		const bool spatial = retinaMode == 1 && HighDPI() && configHandler->GetBool("MacMetalFXSpatial");
+		bool scaled = false;
+		if (!spatial) sharedUpscaleFailed = false;
+		if (spatial && !sharedUpscaleFailed) {
+			void* device = nullptr;
+			void* source = nullptr;
+			void* outputDevice = nullptr;
+			void* output = nullptr;
+			bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+			glFinish();
+			const bool sourceReady = GetSharedColorBuffer(device, source);
+			bindFramebuffer(GL_READ_FRAMEBUFFER, hdrFBO);
+			const bool outputReady = GetSharedColorBuffer(outputDevice, output);
+			scaled = sourceReady && outputReady && device == outputDevice &&
+				MacMetalFX::UpscaleShared(device, source, output);
+			if (!scaled) {
+				sharedUpscaleFailed = true;
+				LOG_L(L_WARNING, "[MacHDR] MetalFX unavailable (%s); using floating-point bilinear scaling",
+					sourceReady && outputReady ? MacMetalFX::GetError() : "Mesa export unavailable");
+			}
+		}
+		bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+		bindFramebuffer(GL_DRAW_FRAMEBUFFER, hdrFBO);
+		if (!scaled)
+			blitFramebuffer(0, 0, sceneX, sceneY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		if (!hdrLogged) LOG("[MacHDR] floating-point game lighting -> HDR display; no added bloom or color grading");
+		hdrLogged = true;
+		return true;
 	}
 
 	void BlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter) {
@@ -378,6 +609,7 @@ namespace Retina {
 	}
 
 	void DestroyScene() {
+		MacMetalFX::WaitShared();
 		if (sceneFBO != 0) glDeleteFramebuffers(1, &sceneFBO);
 		if (sceneColor != 0) glDeleteRenderbuffers(1, &sceneColor);
 		if (sceneDepth != 0) glDeleteRenderbuffers(1, &sceneDepth);
@@ -385,8 +617,146 @@ namespace Retina {
 		sceneX = sceneY = 0;
 	}
 
+	void DestroyUpscaler() {
+		MacMetalFX::WaitShared();
+		if (upscaleFBO != 0) glDeleteFramebuffers(1, &upscaleFBO);
+		if (upscaleColor != 0) glDeleteTextures(1, &upscaleColor);
+		upscaleFBO = upscaleColor = 0;
+		upscaleX = upscaleY = 0;
+		scenePixels.clear();
+		metalFXFailed = false;
+		sharedUpscaleFailed = sharedPresentFailed = false;
+		sharedUpscaleLogged = cpuUpscaleLogged = sharedPresentLogged = false;
+		presentedSharedLastFrame = false;
+		MacMetalFX::Destroy();
+	}
+
+	bool EnsureUpscaleTarget() {
+		GLint previousTexture = 0, unpackBuffer = 0;
+		getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+		getIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+		if (upscaleFBO == 0) {
+			glGenFramebuffers(1, &upscaleFBO);
+			glGenTextures(1, &upscaleColor);
+		}
+		glBindTexture(GL_TEXTURE_2D, upscaleColor);
+		bool valid = true;
+		if (upscaleX != surfSizeX || upscaleY != surfSizeY) {
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, surfSizeX, surfSizeY, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+			bindFramebuffer(GL_READ_FRAMEBUFFER, upscaleFBO);
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, upscaleColor, 0);
+			valid = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+			if (valid) {
+				upscaleX = surfSizeX; upscaleY = surfSizeY;
+				sharedUpscaleLogged = cpuUpscaleLogged = false;
+			}
+		}
+		bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+		glBindTexture(GL_TEXTURE_2D, previousTexture);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackBuffer);
+		return valid;
+	}
+
+	// Called with the scene bound for reading, default framebuffer for drawing,
+	// and scissor disabled. Keep the Metal boundary here so UI is never upscaled.
+	bool UpscaleScene() {
+		if (!configHandler->GetBool("MacMetalFXSpatial")) {
+			metalFXFailed = false;
+			return false;
+		}
+		if (metalFXFailed)
+			return false;
+		if (!EnsureUpscaleTarget())
+			return false;
+
+		if (UseSharedGPU() && !sharedUpscaleFailed) {
+			bool success = false;
+			const char* reason = "bundled Mesa export interface unavailable";
+			if (SharedExportsAvailable()) {
+				glFlush();
+				void* device = nullptr;
+				void* source = nullptr;
+				void* nativeQueue = nullptr;
+				void* outputDevice = nullptr;
+				void* output = nullptr;
+				const bool sourceReady = GetSharedColorBuffer(device, source, &nativeQueue);
+				bindFramebuffer(GL_READ_FRAMEBUFFER, upscaleFBO);
+				const bool outputReady = GetSharedColorBuffer(outputDevice, output);
+				reason = "scene or output framebuffer is not shareable";
+				if (sourceReady && outputReady && device == outputDevice) {
+					success = MacMetalFX::UpscaleShared(device, source, output, SubmitSharedGPU(nativeQueue));
+					reason = MacMetalFX::GetError();
+				}
+				if (success) {
+					blitFramebuffer(0, 0, surfSizeX, surfSizeY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+				}
+				bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+			}
+			if (success) {
+				if (!sharedUpscaleLogged)
+					LOG("[MacMetalFX] spatial upscale %dx%d -> %dx%d; shared GPU textures, native-resolution UI", logicalX, logicalY, surfSizeX, surfSizeY);
+				sharedUpscaleLogged = true;
+				return true;
+			}
+			sharedUpscaleFailed = true;
+			LOG_L(L_WARNING, "[MacGPUSharing] MetalFX sharing unavailable (%s); using CPU staging", reason);
+			MacMetalFX::Destroy();
+		}
+
+		// Widgets may leave PBOs and pixel-store offsets bound. Neither transfer
+		// may inherit those, and all bindings must be restored before UI draws.
+		constexpr GLenum packNames[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS};
+		constexpr GLenum unpackNames[] = {GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS};
+		GLint pack[4], unpack[4], packBuffer = 0, unpackBuffer = 0, previousTexture = 0;
+		getIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+		getIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+		getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+		for (int i = 0; i < 4; ++i) {
+			getIntegerv(packNames[i], &pack[i]);
+			getIntegerv(unpackNames[i], &unpack[i]);
+			glPixelStorei(packNames[i], i == 0 ? 4 : 0);
+			glPixelStorei(unpackNames[i], i == 0 ? 4 : 0);
+		}
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+		scenePixels.resize(size_t(logicalX) * logicalY * 4);
+		readPixels(0, 0, logicalX, logicalY, GL_RGBA, GL_UNSIGNED_BYTE, scenePixels.data());
+		const void* output = nullptr;
+		int outputRowLength = 0;
+		bool success = MacMetalFX::Upscale(scenePixels.data(), logicalX, logicalY, surfSizeX, surfSizeY, output, outputRowLength);
+		if (success) {
+			glBindTexture(GL_TEXTURE_2D, upscaleColor);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, outputRowLength);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, surfSizeX, surfSizeY, GL_RGBA, GL_UNSIGNED_BYTE, output);
+			bindFramebuffer(GL_READ_FRAMEBUFFER, upscaleFBO);
+			blitFramebuffer(0, 0, surfSizeX, surfSizeY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			if (!cpuUpscaleLogged)
+				LOG("[MacMetalFX] spatial upscale %dx%d -> %dx%d; CPU staging, native-resolution UI", logicalX, logicalY, surfSizeX, surfSizeY);
+			cpuUpscaleLogged = true;
+		}
+		bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+		glBindTexture(GL_TEXTURE_2D, previousTexture);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, packBuffer);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackBuffer);
+		for (int i = 0; i < 4; ++i) {
+			glPixelStorei(packNames[i], pack[i]);
+			glPixelStorei(unpackNames[i], unpack[i]);
+		}
+		if (!success) {
+			metalFXFailed = true;
+			LOG_L(L_WARNING, "[MacMetalFX] %s; using bilinear scaling (toggle off/on to retry)", MacMetalFX::GetError());
+			MacMetalFX::Destroy();
+		}
+		return success;
+	}
+
 	bool EnsureScene() {
-		if (sceneFBO != 0 && sceneX == logicalX && sceneY == logicalY)
+		const int width = hdrFrame && retinaMode == 2 ? surfSizeX : logicalX;
+		const int height = hdrFrame && retinaMode == 2 ? surfSizeY : logicalY;
+		if (sceneFBO != 0 && sceneX == width && sceneY == height && sceneHDR == hdrFrame)
 			return true;
 		GLint read = 0, draw = 0, rbo = 0;
 		getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
@@ -397,11 +767,11 @@ namespace Retina {
 		bindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
 		glGenRenderbuffers(1, &sceneColor);
 		glBindRenderbuffer(GL_RENDERBUFFER, sceneColor);
-		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, logicalX, logicalY);
+		glRenderbufferStorage(GL_RENDERBUFFER, hdrFrame ? GL_RGBA16F : GL_RGBA8, width, height);
 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, sceneColor);
 		glGenRenderbuffers(1, &sceneDepth);
 		glBindRenderbuffer(GL_RENDERBUFFER, sceneDepth);
-		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, logicalX, logicalY);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, sceneDepth);
 		const bool valid = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 		bindFramebuffer(GL_READ_FRAMEBUFFER, read);
@@ -412,27 +782,58 @@ namespace Retina {
 			LOG_L(L_ERROR, "[MacRetina] could not create scene framebuffer");
 			return false;
 		}
-		sceneX = logicalX; sceneY = logicalY;
+		sceneX = width; sceneY = height; sceneHDR = hdrFrame;
 		return true;
+	}
+
+	bool EnsureLogicalReadTarget() {
+		if (logicalReadFBO && logicalReadX == logicalX && logicalReadY == logicalY) return true;
+		GLint read = 0, draw = 0, rbo = 0;
+		getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+		getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+		getIntegerv(GL_RENDERBUFFER_BINDING, &rbo);
+		if (!logicalReadFBO) {
+			glGenFramebuffers(1, &logicalReadFBO);
+			glGenRenderbuffers(1, &logicalReadColor);
+		}
+		bindFramebuffer(GL_FRAMEBUFFER, logicalReadFBO);
+		glBindRenderbuffer(GL_RENDERBUFFER, logicalReadColor);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA16F, logicalX, logicalY);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, logicalReadColor);
+		const bool valid = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+		bindFramebuffer(GL_READ_FRAMEBUFFER, read);
+		bindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+		glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+		if (valid) { logicalReadX = logicalX; logicalReadY = logicalY; }
+		return valid;
 	}
 
 	template<typename F>
 	void ReadLogical(F&& read) {
-		if (!Scaled(GL_READ_FRAMEBUFFER_BINDING) || !EnsureScene()) {
+		if (!Scaled(GL_READ_FRAMEBUFFER_BINDING)) {
 			read();
 			return;
 		}
-		GLint previousDraw = 0;
+		GLint previousRead = 0, previousDraw = 0;
+		getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousRead);
 		getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDraw);
+		// Full Retina HDR can be copied by an effect while the world is drawing.
+		// Downsample into a separate target; an overlapping self-blit is undefined.
+		const bool copyingWorld = hdrFrame && drawingScene;
+		if (!(copyingWorld ? EnsureLogicalReadTarget() : EnsureScene())) {
+			read();
+			return;
+		}
+		const GLuint target = copyingWorld ? logicalReadFBO : sceneFBO;
 		const bool clipped = glIsEnabled(GL_SCISSOR_TEST);
 		glDisable(GL_SCISSOR_TEST);
-		bindFramebuffer(GL_DRAW_FRAMEBUFFER, sceneFBO);
+		bindFramebuffer(GL_DRAW_FRAMEBUFFER, target);
 		blitFramebuffer(0, 0, surfSizeX, surfSizeY, 0, 0, logicalX, logicalY, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-		bindFramebuffer(GL_READ_FRAMEBUFFER, sceneFBO);
+		bindFramebuffer(GL_READ_FRAMEBUFFER, target);
 		bindFramebuffer(GL_DRAW_FRAMEBUFFER, previousDraw);
 		if (clipped) glEnable(GL_SCISSOR_TEST);
 		read();
-		bindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		bindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
 	}
 
 	void CopyTexSubImage2D(GLenum target, GLint level, GLint xoff, GLint yoff, GLint x, GLint y, GLsizei w, GLsizei h) {
@@ -454,6 +855,9 @@ namespace Retina {
 		WRAP("glBlitFramebufferEXT", blitFramebuffer, BlitFramebuffer);
 		WRAP("glCopyTexSubImage2D", copyTexSubImage2D, CopyTexSubImage2D);
 		WRAP("glReadPixels", readPixels, ReadPixels);
+		WRAP("glReadBuffer", readBuffer, ReadBuffer);
+		WRAP("glDrawBuffer", drawBuffer, DrawBuffer);
+		WRAP("glDrawBuffers", drawBuffers, DrawBuffers);
 		#undef WRAP
 		return real;
 	}
@@ -505,30 +909,75 @@ void MacEGLBridge::BeginScene()
 {
 	if (context == nullptr || renderer == nullptr) return;
 	Retina::UpdateSurface();
-	Retina::drawingScene = retinaMode == 1 && Retina::HighDPI() && Retina::EnsureScene();
+	// Keep the completed float frame readable between draws (screenshots and
+	// widgets run during Update), then detach before reallocating its resources.
+	Retina::bindFramebuffer(GL_FRAMEBUFFER, 0);
+	hdrFrame = false;
+	hdrSceneDrawn = true;
+	const bool requested = configHandler->GetBool("MacHDR");
+	if (requested != previousHDRRequest) {
+		hdrFailed = hdrLogged = hdrUnavailableLogged = false;
+		loggedHDRHeadroom = 0.0f;
+		sharedPresentFailed = false;
+		previousHDRRequest = requested;
+	}
+	if (!requested) { hdrFailed = hdrLogged = false; Retina::DestroyHDR(); }
+	hdrFrame = requested && !hdrFailed && SharedExportsAvailable() &&
+		MacMetalFX::ConfigureHDR(SDL_RenderGetMetalLayer(renderer), NativeWindow(), true);
+	if (requested && !hdrFailed && !hdrFrame && !hdrUnavailableLogged) {
+		LOG_L(L_WARNING, "[MacHDR] HDR display or bundled Mesa sharing unavailable; using SDR");
+		hdrUnavailableLogged = true;
+	}
+	if (hdrFrame) hdrUnavailableLogged = false;
+	if (hdrFrame && !Retina::EnsureHDR()) {
+		LOG_L(L_WARNING, "[MacHDR] floating-point composition target unavailable; using SDR");
+		hdrFrame = false; hdrFailed = true;
+	}
+	Retina::drawingScene = (hdrFrame || (retinaMode == 1 && Retina::HighDPI())) && Retina::EnsureScene();
+	if (hdrFrame && !Retina::drawingScene) { hdrFrame = false; hdrFailed = true; }
+	if (hdrFrame) {
+		Retina::getIntegerv(GL_CLAMP_VERTEX_COLOR, &Retina::vertexClamp);
+		Retina::getIntegerv(GL_CLAMP_FRAGMENT_COLOR, &Retina::fragmentClamp);
+		// Legacy vertex-only shaders (notably the mirrored map edge) rely on
+		// clamped gl_FrontColor alpha. HDR energy comes from fragment shaders
+		// and additive blending, which remain unclamped in the float target.
+		glClampColor(GL_CLAMP_VERTEX_COLOR, GL_TRUE);
+		glClampColor(GL_CLAMP_FRAGMENT_COLOR, GL_FALSE);
+	} else {
+		MacMetalFX::ConfigureHDR(SDL_RenderGetMetalLayer(renderer), NativeWindow(), false);
+	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 void MacEGLBridge::BeginUI()
 {
 	if (context == nullptr || renderer == nullptr) return;
-	GLint viewport[4] = {}, scissor[4] = {};
-	glGetIntegerv(GL_VIEWPORT, viewport);
-	glGetIntegerv(GL_SCISSOR_BOX, scissor);
 	Retina::UpdateSurface();
 	if (Retina::drawingScene) {
 		const bool clipped = glIsEnabled(GL_SCISSOR_TEST);
 		glDisable(GL_SCISSOR_TEST);
 		Retina::bindFramebuffer(GL_READ_FRAMEBUFFER, Retina::sceneFBO);
-		Retina::bindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-		Retina::blitFramebuffer(0, 0, Retina::logicalX, Retina::logicalY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-		Retina::blitFramebuffer(0, 0, Retina::logicalX, Retina::logicalY, 0, 0, surfSizeX, surfSizeY, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+		const bool wasHDR = hdrFrame;
+		if (hdrFrame && !Retina::RenderHDRScene()) {
+			hdrFrame = false;
+			MacMetalFX::ConfigureHDR(SDL_RenderGetMetalLayer(renderer), NativeWindow(), false);
+		}
+		Retina::bindFramebuffer(GL_DRAW_FRAMEBUFFER, hdrFrame ? Retina::hdrFBO : 0);
+		if (!hdrFrame && (wasHDR || !Retina::UpscaleScene()))
+			Retina::blitFramebuffer(0, 0, Retina::sceneX, Retina::sceneY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		Retina::blitFramebuffer(0, 0, Retina::sceneX, Retina::sceneY, 0, 0, surfSizeX, surfSizeY, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+		if (wasHDR) {
+			glClampColor(GL_CLAMP_VERTEX_COLOR, Retina::vertexClamp);
+			glClampColor(GL_CLAMP_FRAGMENT_COLOR, Retina::fragmentClamp);
+		}
 		if (clipped) glEnable(GL_SCISSOR_TEST);
 	}
 	Retina::drawingScene = false;
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-	glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+	// World and offscreen passes can leave a smaller viewport. UI always starts
+	// with logical screen bounds, then the GL wrappers apply the backing scale.
+	glViewport(globalRendering->viewPosX, globalRendering->viewPosY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+	glScissor(globalRendering->viewPosX, globalRendering->viewPosY, globalRendering->viewSizeX, globalRendering->viewSizeY);
 }
 
 
@@ -612,6 +1061,8 @@ void MacEGLBridge::DestroyContext()
 {
 	if (context == nullptr)
 		return;
+	MacMetalFX::StopDisplayLink();
+	MacMetalFX::WaitShared();
 
 	if (texture != nullptr)
 		SDL_DestroyTexture(texture);
@@ -625,6 +1076,8 @@ void MacEGLBridge::DestroyContext()
 	egl.MakeCurrent(display, surface, surface, context);
 	Retina::drawingScene = false;
 	Retina::DestroyScene();
+	Retina::DestroyHDR();
+	Retina::DestroyUpscaler();
 	for (unsigned int i = 0; i < NUM_PBOS; i++) {
 		if (fences[i] != nullptr)
 			glDeleteSync(fences[i]);
@@ -658,11 +1111,100 @@ void MacEGLBridge::SetSwapInterval(int interval)
 		LOG_L(L_ERROR, "[MacEGLBridge] could not enable required VSync: %s", SDL_GetError());
 }
 
+void MacEGLBridge::WaitForFrame()
+{
+	if (context == nullptr || renderer == nullptr)
+		return;
+	if (!configHandler->GetBool("MacDisplayLink") || pixelPresentFailed) {
+		MacMetalFX::StopDisplayLink();
+		displayLinkLogged = false;
+		return;
+	}
+	SDL_DisplayMode mode = {};
+	SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(presenterWindow), &mode);
+	const bool visible = !(SDL_GetWindowFlags(presenterWindow) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+	if (MacMetalFX::WaitForFrame(SDL_RenderGetMetalLayer(renderer), mode.refresh_rate, visible) && !displayLinkLogged) {
+		LOG("[MacDisplayLink] display-driven frame pacing enabled; preferred latency 2 frames, display %d Hz", mode.refresh_rate);
+		displayLinkLogged = true;
+	}
+}
+
 void MacEGLBridge::SwapWindow(SDL_Window* window)
 {
 	if (context == nullptr || renderer == nullptr)
 		return;
 
+	// A controller that did not draw a world frame (lobby/loading) uses SDR.
+	if (!hdrSceneDrawn && hdrFrame) {
+		hdrFrame = false;
+		Retina::bindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
+	hdrSceneDrawn = false;
+	if (!hdrFrame) MacMetalFX::ConfigureHDR(SDL_RenderGetMetalLayer(renderer), NativeWindow(), false);
+	if (UseSharedGPU() && !sharedPresentFailed) {
+		GLint previousReadFBO = 0;
+		Retina::getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFBO);
+		Retina::bindFramebuffer(GL_READ_FRAMEBUFFER, hdrFrame ? Retina::hdrFBO : 0);
+		GLint previousReadBuffer = GL_BACK;
+		Retina::getIntegerv(GL_READ_BUFFER, &previousReadBuffer);
+		glReadBuffer(hdrFrame ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+		bool success = false;
+		const char* reason = "bundled Mesa export interface unavailable";
+		if (SharedExportsAvailable()) {
+			glFlush();
+			void* device = nullptr;
+			void* source = nullptr;
+			void* nativeQueue = nullptr;
+			reason = "presentation framebuffer is not shareable";
+			if (GetSharedColorBuffer(device, source, &nativeQueue)) {
+				const float headroom = hdrFrame ? MacMetalFX::HDRHeadroom(NativeWindow()) : 0.0f;
+				if (hdrFrame && std::abs(headroom - loggedHDRHeadroom) >= 0.25f) {
+					LOG("[MacHDR] display brightness headroom %.2fx SDR white", headroom);
+					loggedHDRHeadroom = headroom;
+				}
+				success = MacMetalFX::PresentShared(device, source, SDL_RenderGetMetalLayer(renderer), headroom, SubmitSharedGPU(nativeQueue));
+				reason = MacMetalFX::GetError();
+			}
+		}
+		glReadBuffer(previousReadBuffer);
+		Retina::bindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFBO);
+		if (success) {
+			if (!sharedPresentLogged)
+				LOG("[MacGPUSharing] presenting shared GPU texture; no final-frame CPU readback");
+			sharedPresentLogged = true;
+			presentedSharedLastFrame = true;
+			Retina::bindFramebuffer(GL_FRAMEBUFFER, hdrFrame ? Retina::hdrFBO : 0);
+			Retina::UpdateSurface();
+			return;
+		}
+		sharedPresentFailed = true;
+		LOG_L(L_WARNING, "[MacGPUSharing] shared presentation unavailable (%s); using PBO readback", reason);
+	}
+	if (hdrFrame) {
+		const bool clipped = glIsEnabled(GL_SCISSOR_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		Retina::bindFramebuffer(GL_READ_FRAMEBUFFER, Retina::hdrFBO);
+		Retina::bindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		Retina::blitFramebuffer(0, 0, surfSizeX, surfSizeY, 0, 0, surfSizeX, surfSizeY, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		if (clipped) glEnable(GL_SCISSOR_TEST);
+		Retina::bindFramebuffer(GL_FRAMEBUFFER, 0);
+		hdrFrame = false; hdrFailed = true;
+		MacMetalFX::ConfigureHDR(SDL_RenderGetMetalLayer(renderer), NativeWindow(), false);
+		LOG_L(L_WARNING, "[MacHDR] HDR presentation unavailable; using SDR (toggle HDR off/on to retry)");
+	}
+	if (presentedSharedLastFrame) {
+		// Discard frames queued before sharing was enabled, rather than showing stale images.
+		for (unsigned int i = 0; i < NUM_PBOS; ++i) {
+			if (fences[i]) glDeleteSync(fences[i]);
+			fences[i] = nullptr;
+			pboSizes[i][0] = pboSizes[i][1] = 0;
+		}
+		if (texture) SDL_DestroyTexture(texture);
+		texture = nullptr;
+		texSizeX = texSizeY = 0;
+		frameIdx = 0;
+		presentedSharedLastFrame = false;
+	}
 
 	GLint prevPackBuf = 0, prevReadFBO = 0, prevAlign = 4, prevRowLen = 0, prevReadBuf = GL_BACK;
 	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPackBuf);
@@ -700,6 +1242,7 @@ void MacEGLBridge::SwapWindow(SDL_Window* window)
 
 	const int px = pboSizes[prv][0];
 	const int py = pboSizes[prv][1];
+	bool presentedPixels = false;
 
 	if (fences[prv] != nullptr && px > 0 && py > 0) {
 		glClientWaitSync(fences[prv], 0, GL_TIMEOUT_IGNORED);
@@ -710,7 +1253,19 @@ void MacEGLBridge::SwapWindow(SDL_Window* window)
 		const void* data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, px * py * 4, GL_MAP_READ_BIT);
 
 		if (data != nullptr) {
-			if (texture == nullptr || texSizeX != px || texSizeY != py) {
+			if (!pixelPresentFailed) {
+				presentedPixels = MacMetalFX::PresentPixels(data, px, py, SDL_RenderGetMetalLayer(renderer));
+				if (presentedPixels && !pixelPresentLogged) {
+					LOG("[MacEGLBridge] presenting PBO pixels through reusable Metal textures");
+					pixelPresentLogged = true;
+				} else if (!presentedPixels) {
+					pixelPresentFailed = true;
+					MacMetalFX::StopDisplayLink();
+					MacMetalFX::WaitShared();
+					LOG_L(L_WARNING, "[MacEGLBridge] reusable Metal presentation failed (%s); using SDL upload", MacMetalFX::GetError());
+				}
+			}
+			if (!presentedPixels && (texture == nullptr || texSizeX != px || texSizeY != py)) {
 				if (texture != nullptr)
 					SDL_DestroyTexture(texture);
 				texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, px, py);
@@ -720,7 +1275,7 @@ void MacEGLBridge::SwapWindow(SDL_Window* window)
 
 			void* pixels = nullptr;
 			int pitch = 0;
-			if (texture != nullptr && SDL_LockTexture(texture, nullptr, &pixels, &pitch) == 0) {
+			if (!presentedPixels && texture != nullptr && SDL_LockTexture(texture, nullptr, &pixels, &pitch) == 0) {
 				if (pitch == px * 4) {
 					memcpy(pixels, data, px * py * 4);
 				} else {
@@ -740,7 +1295,7 @@ void MacEGLBridge::SwapWindow(SDL_Window* window)
 	glPixelStorei(GL_PACK_ROW_LENGTH, prevRowLen);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
 
-	if (texture != nullptr) {
+	if (!presentedPixels && texture != nullptr) {
 		SDL_RenderCopyEx(renderer, texture, nullptr, nullptr, 0.0, nullptr, SDL_FLIP_VERTICAL);
 		SDL_RenderPresent(renderer);
 	}

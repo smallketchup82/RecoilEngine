@@ -2,7 +2,8 @@
 
 #pragma once
 
-// Renders through Mesa EGL + Zink into a pbuffer and presents it via SDL_Renderer.
+// Renders through Mesa EGL + Zink and presents through reusable Metal textures.
+// Patched Mesa also supports shared GPU textures; SDL remains the upload fallback.
 
 #if defined(__APPLE__) && defined(MAC_EGL_ZINK) && !defined(HEADLESS)
 	#define MAC_EGL_BRIDGE_AVAILABLE 1
@@ -20,9 +21,10 @@ namespace MacEGLBridge {
 	void DestroyContext();
 	void* GetProcAddress(const char* name);
 
-	// reads back the pbuffer and presents it; resizes the pbuffer to track the window
+	// presents the pbuffer and resizes it to track the window
 	void SwapWindow(SDL_Window* window);
 	void SetSwapInterval(int interval);
+	void WaitForFrame();
 
 	// The world uses logical resolution; the final UI uses backing pixels.
 	void BeginScene();
@@ -31,5 +33,23 @@ namespace MacEGLBridge {
 	int GetRetinaMode();
 	void ScaleSceneSize(int& width, int& height);
 	void CopyToTexturePixels(unsigned int target, int level, int xoff, int yoff, int x, int y, int width, int height);
+}
+
+// Objective-C++ boundary: the engine uses GCC, MetalFX uses Apple's compiler.
+namespace MacMetalFX {
+	bool WaitForFrame(void* layer, int refreshRate, bool visible = true);
+	void StopDisplayLink();
+
+	bool Upscale(const void* rgba, int width, int height, int outputWidth, int outputHeight, const void*& output, int& outputRowLength);
+	// A native Mesa queue enables GPU event synchronization. Without it, wait on the CPU.
+	bool UpscaleShared(void* device, void* input, void* output, void* nativeQueue = nullptr);
+	bool PresentShared(void* device, void* input, void* layer, float headroom = 0.0f, void* nativeQueue = nullptr);
+	bool PresentPixels(const void* rgba, int width, int height, void* layer);
+	// Drain before releasing borrowed Mesa allocations, resizing, or changing paths.
+	void WaitShared();
+	bool ConfigureHDR(void* layer, void* nativeWindow, bool enabled);
+	float HDRHeadroom(void* nativeWindow);
+	const char* GetError();
+	void Destroy();
 }
 #endif
